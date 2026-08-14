@@ -73,7 +73,7 @@ def main():
 
     if not Path(args.model_path).exists():
         raise FileNotFoundError(
-            f"No checkpoint at '{args.model_path}'."ß
+            f"No checkpoint at '{args.model_path}'."
         )
 
     device = str(get_device())
