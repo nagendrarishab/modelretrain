@@ -4,8 +4,10 @@
         --droidcam-ip 192.168.0.107 --droidcam-port 4747
 """
 import argparse
+import logging
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 
 import certifi
@@ -15,6 +17,27 @@ os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 import cv2
 import torch
 from ultralytics import YOLO
+
+logger = logging.getLogger("camera_yolo_detect")
+
+
+def setup_logging(log_dir):
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    log_path = Path(log_dir) / f"detect_{datetime.now():%Y%m%d_%H%M%S}.log"
+
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S")
+
+    file_handler = logging.FileHandler(log_path)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    logger.info(f"Logging to {log_path}")
+    return log_path
 
 
 def get_device():
@@ -38,7 +61,7 @@ def open_capture(args):
 
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video source: {source_desc}")
-    print(f"Streaming from {source_desc}")
+    logger.info(f"Streaming from {source_desc}")
     return cap
 
 
@@ -55,6 +78,18 @@ def draw_detections(frame, result):
         cv2.putText(frame, text, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
 
+def log_detections(result):
+    if not len(result.boxes):
+        logger.info("No detections")
+        return
+    parts = []
+    for box in result.boxes:
+        label = result.names[int(box.cls[0])]
+        confidence = float(box.conf[0])
+        parts.append(f"{label} ({confidence:.0%})")
+    logger.info("Detected: " + ", ".join(parts))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", default="models/yolo26n_best.pt")
@@ -69,7 +104,12 @@ def main():
                          help="override the full DroidCam stream URL instead of building it from ip/port")
     parser.add_argument("--reconnect-delay", type=float, default=2.0,
                          help="seconds to wait before retrying a dropped stream")
+    parser.add_argument("--log-dir", default="logs", help="directory to write detection logs to")
+    parser.add_argument("--log-interval", type=float, default=1.0,
+                         help="minimum seconds between logged detection snapshots (avoids per-frame spam)")
     args = parser.parse_args()
+
+    setup_logging(args.log_dir)
 
     if not Path(args.model_path).exists():
         raise FileNotFoundError(
@@ -77,18 +117,19 @@ def main():
         )
 
     device = str(get_device())
-    print(f"Using device: {device}")
+    logger.info(f"Using device: {device}")
     model = YOLO(args.model_path)
-    print(f"Loaded model, classes: {model.names}, confidence threshold: {args.conf:.0%}")
+    logger.info(f"Loaded model, classes: {model.names}, confidence threshold: {args.conf:.0%}")
 
     cap = open_capture(args)
     window = "Box Detector - YOLO (q to quit)"
+    last_log_time = 0.0
 
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
-                print("Lost the video stream, retrying...")
+                logger.warning("Lost the video stream, retrying...")
                 cap.release()
                 time.sleep(args.reconnect_delay)
                 cap = open_capture(args)
@@ -96,6 +137,11 @@ def main():
 
             result = model.predict(frame, imgsz=args.img_size, conf=args.conf, device=device, verbose=False)[0]
             draw_detections(frame, result)
+
+            now = time.monotonic()
+            if now - last_log_time >= args.log_interval:
+                log_detections(result)
+                last_log_time = now
 
             cv2.imshow(window, frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
