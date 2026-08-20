@@ -1,6 +1,6 @@
 """
-    python src/run_camera_yolo_detect.py --model-path models/yolo26n_best.pt --source webcam
-    python src/run_camera_yolo_detect.py --model-path models/yolo26n_best.pt --source droidcam \
+    python src/run_camera_yolo_pose_detect.py --model-path models/yolo26n-pose_best.pt --source webcam
+    python src/run_camera_yolo_pose_detect.py --model-path models/yolo26n-pose_best.pt --source droidcam \
         --droidcam-ip 192.168.0.107 --droidcam-port 4747
 """
 import argparse
@@ -18,7 +18,9 @@ import cv2
 import torch
 from ultralytics import YOLO
 
-logger = logging.getLogger("camera_yolo_detect")
+logger = logging.getLogger("camera_yolo_pose_detect")
+
+KPT_CONNECTIONS = [(0, 1), (1, 2), (2, 3), (3, 0)]
 
 
 def setup_logging(log_dir):
@@ -47,6 +49,7 @@ def get_device():
         return torch.device("mps")
     return torch.device("cpu")
 
+
 LABEL_COLORS = {"open": (0, 200, 0), "closed": (0, 0, 220)}  # BGR
 
 
@@ -68,14 +71,29 @@ def open_capture(args):
     return cap
 
 
-def draw_detections(frame, result):
-    for box in result.boxes:
-        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+def draw_detections(frame, result, kpt_conf_thresh):
+    has_keypoints = result.keypoints is not None and len(result.keypoints.xy)
+    for i, box in enumerate(result.boxes):
         label = result.names[int(box.cls[0])]
         confidence = float(box.conf[0])
         color = LABEL_COLORS.get(label, (255, 255, 255))
 
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        if has_keypoints:
+            kpts_xy = result.keypoints.xy[i]
+            kpts_conf = result.keypoints.conf[i] if result.keypoints.conf is not None else None
+            for a, b in KPT_CONNECTIONS:
+                if kpts_conf is not None and (kpts_conf[a] < kpt_conf_thresh or kpts_conf[b] < kpt_conf_thresh):
+                    continue
+                pt_a = tuple(map(int, kpts_xy[a].tolist()))
+                pt_b = tuple(map(int, kpts_xy[b].tolist()))
+                cv2.line(frame, pt_a, pt_b, color, 2)
+            for x, y in kpts_xy.tolist():
+                cv2.circle(frame, (int(x), int(y)), 4, color, -1)
+        else:
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+        x1, y1, _, _ = map(int, box.xyxy[0].tolist())
         text = f"{label} ({confidence:.0%})"
         text_y = max(20, y1 - 8)
         cv2.putText(frame, text, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
@@ -95,10 +113,12 @@ def log_detections(result):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", default="models/yolo26n_best.pt")
+    parser.add_argument("--model-path", default="models/yolo26n-pose_best.pt")
     parser.add_argument("--img-size", type=int, default=640)
     parser.add_argument("--conf", type=float, default=0.5,
-                         help="minimum confidence to consider the box 'visible' and draw anything")
+                         help="minimum confidence to consider the box 'visible' and draw anything - "
+                              "also used to skip drawing a corner-to-corner edge if either keypoint's "
+                              "confidence falls below it")
     parser.add_argument("--source", choices=["webcam", "droidcam"], default="webcam")
     parser.add_argument("--camera-index", type=int, default=0, help="webcam device index")
     parser.add_argument("--camera-width", type=int, default=1920, help="requested capture width (webcam source only)")
@@ -131,7 +151,7 @@ def main():
     logger.info(f"Loaded model, classes: {model.names}, confidence threshold: {args.conf:.0%}")
 
     cap = open_capture(args)
-    window = "Box Detector - YOLO (q to quit)"
+    window = "Box Detector - YOLO Pose (q to quit)"
     last_log_time = 0.0
     last_save_time = 0.0
 
@@ -158,7 +178,7 @@ def main():
                 last_save_time = now
 
             result = model.predict(frame, imgsz=args.img_size, conf=args.conf, device=device, verbose=False)[0]
-            draw_detections(frame, result)
+            draw_detections(frame, result, args.conf)
 
             if now - last_log_time >= args.log_interval:
                 log_detections(result)

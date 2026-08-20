@@ -14,3 +14,4 @@ data_source_video/
 *.mp4
 *.md
 logs/
+*.zip

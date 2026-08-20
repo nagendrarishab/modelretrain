@@ -1,32 +1,38 @@
 """
-Requires a Gemini API key in a .env file at the project root
+Requires an API key in a .env file at the project root for whichever
+--provider is selected: GEMINI_API_KEY for gemini, OPENROUTER_API_KEY for
+openrouter.
 
-Pass --skip-gemini to go straight to the generic detector fallback - no key
+Pass --skip-vlm to go straight to the generic detector fallback - no key
 needed, and skips the network round-trip + retries entirely. Useful while
-Gemini's daily free-tier quota is exhausted (manual work)
+the VLM provider's free-tier quota is exhausted (manual work)
+
+Supports multiple boxes per image: both the VLM and the generic detector
+suggest every box they find (not just the top one), and each mouse drag
+adds a new box rather than replacing the previous one, so if more than one
+physical box is in frame, they're pre-loaded together - or drag once per
+box yourself.
 
 Controls:
-  y                       accept the suggested box as-is, move to next
-  drag left mouse button  redraw the box (overrides the suggestion)
-  n / Enter               save the current box and move to the next image
-  r                       clear the box on this image and redraw
-  s                       skip this image (no label saved, move on)
-  b                       go back to the previous image
-  q / Esc                 quit (progress already saved is kept)
+  drag left mouse button  add a box (suggested boxes, if any, are pre-loaded
+                           first - drag again to add more)
+  y / n / Enter            save all boxes currently drawn, move to next
+  r                        undo the most recently added box
+  s                        skip this image (no label saved, move on)
+  b                        go back to the previous image
+  q / Esc                  quit (progress already saved is kept)
 
-If neither Gemini nor the generic detector finds a box, the review window
-opens empty so you can draw it manually.
-
-Already-labeled images are skipped on the next run unless --overwrite is
-passed, so annotation can be resumed across sessions.
 """
 import argparse
+import base64
+import io
 import json
 import os
 import time
 from pathlib import Path
 
 import cv2
+import httpx
 import numpy as np
 from dotenv import load_dotenv
 from google import genai
@@ -42,12 +48,8 @@ class BoxState:
     def __init__(self):
         self.dragging = False
         self.start = None
-        self.rect = None 
-
-    def reset(self):
-        self.dragging = False
-        self.start = None
-        self.rect = None
+        self.current = None  # in-progress drag rect, not yet committed
+        self.boxes = []  # committed (x1, y1, x2, y2) rects, display pixel coords
 
 
 def make_mouse_callback(state, disp_w, disp_h):
@@ -60,12 +62,15 @@ def make_mouse_callback(state, disp_w, disp_h):
         if event == cv2.EVENT_LBUTTONDOWN:
             state.dragging = True
             state.start = (x, y)
-            state.rect = (x, y, x, y)
+            state.current = (x, y, x, y)
         elif event == cv2.EVENT_MOUSEMOVE and state.dragging:
-            state.rect = (state.start[0], state.start[1], x, y)
+            state.current = (state.start[0], state.start[1], x, y)
         elif event == cv2.EVENT_LBUTTONUP:
             state.dragging = False
-            state.rect = (state.start[0], state.start[1], x, y)
+            x1, y1 = state.start
+            state.current = None
+            if abs(x - x1) >= 3 and abs(y - y1) >= 3:  # ignore accidental clicks
+                state.boxes.append((x1, y1, x, y))
 
     return callback
 
@@ -81,11 +86,12 @@ def rect_to_yolo_line(rect, disp_w, disp_h, class_id):
     return f"{class_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n"
 
 
-PROMPT = """Find the plastic storage box/container (it has a flat lid and may be \
-open or closed) in this image. Respond with ONLY a JSON array, no other text.
+PROMPT = """Find every plastic storage box/container (each has a flat lid and may \
+be open or closed) in this image - there may be more than one. Respond with ONLY a
+JSON array, no other text.
 
-If the box is visible, the array has exactly one object:
-[{"box_2d": [ymin, xmin, ymax, xmax]}]
+Include one object per box found:
+[{"box_2d": [ymin, xmin, ymax, xmax]}, ...]
 where each coordinate is normalized to 0-1000 relative to image height/width.
 
 If no such box is visible anywhere in the image, respond with an empty array: []
@@ -98,6 +104,26 @@ def load_full_image(path):
     return img, img.width, img.height
 
 
+def _parse_box_response(text, image):
+    """Parse a model's raw text reply into a list of (x1, y1, x2, y2) pixel
+    coords - empty if it reported no box. Shared by every VLM provider,
+    since they're all prompted for the identical box_2d JSON format."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        text = text[text.find("[") :]
+    boxes = json.loads(text)
+    rects = []
+    for b in boxes:
+        ymin, xmin, ymax, xmax = b["box_2d"]
+        x1 = xmin / 1000 * image.width
+        y1 = ymin / 1000 * image.height
+        x2 = xmax / 1000 * image.width
+        y2 = ymax / 1000 * image.height
+        rects.append((x1, y1, x2, y2))
+    return rects
+
+
 def query_gemini_box(client, model, image, max_retries=3):
     for attempt in range(max_retries):
         try:
@@ -106,71 +132,89 @@ def query_gemini_box(client, model, image, max_retries=3):
                 contents=[image, PROMPT],
                 config=types.GenerateContentConfig(temperature=0),
             )
-            text = response.text.strip()
-            if text.startswith("```"):
-                text = text.strip("`")
-                text = text[text.find("[") :]
-            boxes = json.loads(text)
-            if not boxes:
-                return None
-            ymin, xmin, ymax, xmax = boxes[0]["box_2d"]
-            x1 = xmin / 1000 * image.width
-            y1 = ymin / 1000 * image.height
-            x2 = xmax / 1000 * image.width
-            y2 = ymax / 1000 * image.height
-            return (x1, y1, x2, y2)
+            return _parse_box_response(response.text, image)
         except Exception as e:
             wait = 2**attempt
             print(f"    Gemini request failed ({e}); retrying in {wait}s..." if attempt + 1 < max_retries
                   else f"    Gemini request failed ({e}); giving up, leave box empty.")
             if attempt + 1 < max_retries:
                 time.sleep(wait)
-    return None
+    return []
+
+
+def query_openrouter_box(api_key, model, image, max_retries=3):
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG")
+    data_url = f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
+
+    for attempt in range(max_retries):
+        try:
+            response = httpx.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": PROMPT},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ]}],
+                    "temperature": 0,
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+            text = response.json()["choices"][0]["message"]["content"]
+            return _parse_box_response(text, image)
+        except Exception as e:
+            wait = 2**attempt
+            print(f"    OpenRouter request failed ({e}); retrying in {wait}s..." if attempt + 1 < max_retries
+                  else f"    OpenRouter request failed ({e}); giving up, leave box empty.")
+            if attempt + 1 < max_retries:
+                time.sleep(wait)
+    return []
 
 
 def query_generic_detector(detector, image, conf):
+    """Return every box the detector finds above conf (any class), in the
+    image's own pixel coordinates."""
     results = detector.predict(image, conf=conf, verbose=False)[0]
-    if len(results.boxes) == 0:
-        return None
-    best = int(results.boxes.conf.argmax())
-    x1, y1, x2, y2 = results.boxes.xyxy[best].tolist()
-    return (x1, y1, x2, y2)
+    return [tuple(box) for box in results.boxes.xyxy.tolist()]
 
 
-def full_rect_to_display(rect, orig_w, orig_h, disp_w, disp_h):
-    if rect is None:
-        return None
+def full_rects_to_display(rects, orig_w, orig_h, disp_w, disp_h):
     scale_x, scale_y = disp_w / orig_w, disp_h / orig_h
-    x1, y1, x2, y2 = rect
     clamp_x = lambda v: max(0, min(disp_w - 1, round(v * scale_x)))
     clamp_y = lambda v: max(0, min(disp_h - 1, round(v * scale_y)))
-    return (clamp_x(x1), clamp_y(y1), clamp_x(x2), clamp_y(y2))
+    return [(clamp_x(x1), clamp_y(y1), clamp_x(x2), clamp_y(y2)) for x1, y1, x2, y2 in rects]
 
 
-def annotate_one(base_img, disp_w, disp_h, initial_rect, source, path, class_id, window):
+def annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, class_id, window):
     state = BoxState()
-    state.rect = initial_rect
+    state.boxes.extend(initial_rects)
     cv2.setMouseCallback(window, make_mouse_callback(state, disp_w, disp_h))
 
     while True:
         frame = base_img.copy()
-        if state.rect:
-            x1, y1, x2, y2 = state.rect
+        for x1, y1, x2, y2 in state.boxes:
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
-        suggestion_note = f" [{source} suggestion - y=accept]" if initial_rect else " [no suggestion - draw manually]"
-        cv2.putText(frame, f"{path.name} [{CLASSES[class_id]}]{suggestion_note}", (10, 24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        if state.current:
+            x1, y1, x2, y2 = state.current
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 255), 1)
+        suggestion_note = f" [{source}: {len(initial_rects)} suggested]" if initial_rects else " [no suggestion]"
+        status = f" - {len(state.boxes)} box(es), drag to add another, r=undo last"
+        cv2.putText(frame, f"{path.name} [{CLASSES[class_id]}]{suggestion_note}{status}", (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.imshow(window, frame)
         key = cv2.waitKey(20) & 0xFF
 
-        if key == ord("y") and initial_rect:
-            return ("save", rect_to_yolo_line(initial_rect, disp_w, disp_h, class_id))
-        if key in (ord("n"), 13):  # n or Enter
-            if state.rect is None:
-                continue  # need a box before advancing
-            return ("save", rect_to_yolo_line(state.rect, disp_w, disp_h, class_id))
+        if key in (ord("y"), ord("n"), 13):  # y, n, or Enter - all save+advance
+            if not state.boxes:
+                continue  # need at least one box before advancing
+            lines = "".join(rect_to_yolo_line(b, disp_w, disp_h, class_id) for b in state.boxes)
+            return ("save", lines)
         if key == ord("r"):
-            state.reset()
+            if state.boxes:
+                state.boxes.pop()
         elif key == ord("s"):
             return ("skip", None)
         elif key == ord("b"):
@@ -183,24 +227,29 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--raw-dir", default="raw")
     parser.add_argument("--labels-dir", default="raw_labels")
-    parser.add_argument("--model", default="gemini-3.6-flash", help="Gemini model to query for box suggestions")
+    parser.add_argument("--provider", choices=["gemini", "openrouter"], default="openrouter",
+                         help="which VLM to query for tier-1 box suggestions")
+    parser.add_argument("--model", default="gemini-3.6-flash", help="Gemini model name (only used with --provider gemini)")
+    parser.add_argument("--openrouter-model", default="nvidia/nemotron-nano-12b-v2-vl:free",
+                         help="OpenRouter model name (only used with --provider openrouter)")
     parser.add_argument("--detector-model", default="yolo26n.pt",
-                         help="generic pretrained detector used as fallback when Gemini finds nothing")
+                         help="generic pretrained detector used as fallback when the VLM finds nothing")
     parser.add_argument("--detector-conf", type=float, default=0.25,
                          help="confidence threshold for the fallback detector")
     parser.add_argument("--overwrite", action="store_true", help="re-annotate images that already have a label")
-    parser.add_argument("--skip-gemini", action="store_true",
-                         help="go straight to the local detector fallback, e.g. while Gemini's daily quota is exhausted")
+    parser.add_argument("--skip-vlm", action="store_true",
+                         help="go straight to the local detector fallback, e.g. while the VLM's free quota is exhausted")
     args = parser.parse_args()
 
-    client = None
-    if not args.skip_gemini:
+    vlm_client = None
+    if not args.skip_vlm:
         load_dotenv()
-        api_key = os.environ.get("GEMINI_API_KEY")
+        env_var = "GEMINI_API_KEY" if args.provider == "gemini" else "OPENROUTER_API_KEY"
+        api_key = os.environ.get(env_var)
         if not api_key:
-            raise SystemExit("Set GEMINI_API_KEY in a .env file, "
-                              "or pass --skip-gemini to use only the local detector.")
-        client = genai.Client(api_key=api_key)
+            raise SystemExit(f"Set {env_var} in a .env file, or pass --skip-vlm to use only the local detector.")
+        # query_gemini_box needs a genai.Client; query_openrouter_box just needs the raw key.
+        vlm_client = genai.Client(api_key=api_key) if args.provider == "gemini" else api_key
     detector = YOLO(args.detector_model)
 
     raw_dir = Path(args.raw_dir)
@@ -224,7 +273,7 @@ def main():
         print("Nothing to do.")
         return
 
-    window = "Auto-annotate (y=accept suggestion, drag=redraw, n=save+next, r=redo, s=skip, b=back, q=quit)"
+    window = "Auto-annotate (drag=add box, n/y/Enter=save+next, r=undo last box, s=skip, b=back, q=quit)"
     cv2.namedWindow(window)
 
     idx = 0
@@ -240,22 +289,25 @@ def main():
         disp_img = full_img.resize((disp_w, disp_h), Image.LANCZOS)
         base_img = cv2.cvtColor(np.array(disp_img), cv2.COLOR_RGB2BGR)
 
-        full_rect, source = None, None
-        if not args.skip_gemini:
-            print("    querying Gemini...")
-            full_rect = query_gemini_box(client, args.model, full_img)
-            source = "Gemini"
-            if full_rect is None:
-                print("    Gemini found nothing; trying generic detector...")
-        if full_rect is None:
-            full_rect = query_generic_detector(detector, full_img, args.detector_conf)
+        full_rects, source = [], None
+        if not args.skip_vlm:
+            print(f"    querying {args.provider}...")
+            if args.provider == "gemini":
+                full_rects = query_gemini_box(vlm_client, args.model, full_img)
+            else:
+                full_rects = query_openrouter_box(vlm_client, args.openrouter_model, full_img)
+            source = args.provider
+            if not full_rects:
+                print(f"    {args.provider} found nothing; trying generic detector...")
+        if not full_rects:
+            full_rects = query_generic_detector(detector, full_img, args.detector_conf)
             source = "generic detector"
-        if full_rect is None:
+        if not full_rects:
             print("    generic detector found nothing either; draw manually.")
             source = None
-        initial_rect = full_rect_to_display(full_rect, orig_w, orig_h, disp_w, disp_h)
+        initial_rects = full_rects_to_display(full_rects, orig_w, orig_h, disp_w, disp_h)
 
-        action, payload = annotate_one(base_img, disp_w, disp_h, initial_rect, source, path, class_id, window)
+        action, payload = annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, class_id, window)
 
         if action == "save":
             (labels_dir / cls / (path.stem + ".txt")).write_text(payload)

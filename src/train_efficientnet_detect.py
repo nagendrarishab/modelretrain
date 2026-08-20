@@ -12,6 +12,7 @@ os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 import torch
 import yaml
 from PIL import Image
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
 from torchvision.models import efficientnet_b0, efficientnet_b1, efficientnet_b2, efficientnet_b3, efficientnet_b4
 from torchvision.models.detection import FasterRCNN
@@ -38,18 +39,11 @@ BACKBONE_WEIGHTS = {
     "efficientnet_b4": "IMAGENET1K_V1",
 }
 
-# Indices into EfficientNet's `.features` Sequential that give strides
-# 4/8/16/32 (the same C2-C5 pyramid levels torchvision's own
-# resnet_fpn_backbone taps from layer1-layer4) - consistent across all
-# b0-b4 variants, only the channel counts at each tap differ.
 FPN_TAP_INDICES = [2, 3, 4, 6]
 
 
 def get_device():
-    # MPS previously made Faster R-CNN's ROIAlign/NMS ops numerically unstable
-    # (loss exploded to NaN within a few batches) - re-enabled per request, but
-    # the training loop below aborts fast on a non-finite loss so a recurrence
-    # is caught in the first few batches instead of burning hours on garbage.
+
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
@@ -58,11 +52,6 @@ def get_device():
 
 
 class YoloFormatDataset(Dataset):
-    """Reads the data_detect/{split}/{images,labels} layout that
-    prepare_detect_dataset.py produces (YOLO-format labels: `class cx cy w h`,
-    normalized 0-1) and converts it to the [x1, y1, x2, y2] absolute-pixel
-    boxes + 1-indexed labels torchvision detection models expect (label 0 is
-    reserved for background)."""
 
     def __init__(self, split_dir):
         self.images_dir = split_dir / "images"
@@ -106,10 +95,7 @@ def collate_fn(batch):
 
 
 def warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor):
-    """Linearly ramps the LR up from warmup_factor*base_lr to base_lr over the
-    first warmup_iters steps. Faster R-CNN's loss reliably explodes to NaN
-    within the first few batches without this - the untrained RPN/ROI heads
-    produce huge early gradients that a full-strength LR overshoots on."""
+
     def f(step):
         if step >= warmup_iters:
             return 1.0
@@ -120,9 +106,7 @@ def warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor):
 
 
 def _probe_fpn_channels(features):
-    """Runs a dummy forward pass through `.features` to read off the channel
-    count at each FPN tap point, rather than hardcoding a table per variant -
-    b0-b4 share the same stage layout but not the same channel counts."""
+
     channels = []
     h = torch.zeros(1, 3, 256, 256)
     with torch.no_grad():
@@ -145,9 +129,11 @@ def build_model(backbone_name, num_classes):
 def evaluate(model, data_loader, device):
     model.eval()
     metric = MeanAveragePrecision(box_format="xyxy")
+    use_amp = device.type == "cuda"
     for images, targets in data_loader:
-        images = [img.to(device) for img in images]
-        preds = model(images)
+        images = [img.to(device, non_blocking=True) for img in images]
+        with autocast(device_type=device.type, enabled=use_amp):
+            preds = model(images)
         preds = [{k: v.cpu() for k, v in p.items()} for p in preds]
         metric.update(preds, targets)
     result = metric.compute()
@@ -163,6 +149,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=0.005)
+    parser.add_argument("--workers", type=int, default=4, help="DataLoader worker processes")
     parser.add_argument("--output", default=None,
                          help="Output path. Defaults to models/efficientnet_<backbone>_detect_best.pt")
     args = parser.parse_args()
@@ -181,19 +168,27 @@ def main():
     num_classes = len(class_names) + 1  # +1 for background
 
     device = get_device()
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
     print(f"Using device: {device}")
 
+    loader_kwargs = dict(
+        collate_fn=collate_fn,
+        num_workers=args.workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.workers > 0,
+    )
     train_loader = DataLoader(
         YoloFormatDataset(data_root / "train"), batch_size=args.batch_size,
-        shuffle=True, collate_fn=collate_fn,
+        shuffle=True, **loader_kwargs,
     )
     val_loader = DataLoader(
         YoloFormatDataset(data_root / "val"), batch_size=args.batch_size,
-        shuffle=False, collate_fn=collate_fn,
+        shuffle=False, **loader_kwargs,
     )
     test_loader = DataLoader(
         YoloFormatDataset(data_root / "test"), batch_size=args.batch_size,
-        shuffle=False, collate_fn=collate_fn,
+        shuffle=False, **loader_kwargs,
     )
     print(f"Train: {len(train_loader.dataset)} images ({len(train_loader)} batches/epoch)  "
           f"Val: {len(val_loader.dataset)}  Test: {len(test_loader.dataset)}")
@@ -205,6 +200,9 @@ def main():
 
     best_map50 = -1.0
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+
+    use_amp = device.type == "cuda"
+    scaler = GradScaler(enabled=use_amp)
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -218,11 +216,12 @@ def main():
 
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", unit="batch")
         for images, targets in progress:
-            images = [img.to(device) for img in images]
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            images = [img.to(device, non_blocking=True) for img in images]
+            targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
 
-            loss_dict = model(images, targets)
-            loss = sum(loss_dict.values())
+            with autocast(device_type=device.type, enabled=use_amp):
+                loss_dict = model(images, targets)
+                loss = sum(loss_dict.values())
 
             if not torch.isfinite(loss):
                 breakdown = ", ".join(f"{k}={v.item():.4f}" for k, v in loss_dict.items())
@@ -233,8 +232,9 @@ def main():
                 )
 
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             if epoch_warmup is not None:
                 epoch_warmup.step()
             epoch_loss += loss.item()

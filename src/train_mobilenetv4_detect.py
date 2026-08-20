@@ -1,33 +1,34 @@
 """
-    python src/train_resnet_detect.py --backbone resnet50 --epochs 30
+    python src/train_mobilenetv4_detect.py --backbone mobilenetv4_conv_medium --epochs 30
 """
 import argparse
 import os
+from collections import OrderedDict
 from pathlib import Path
 
 import certifi
 
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 
+import timm
 import torch
+import torch.nn as nn
 import yaml
 from PIL import Image
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
 from torchvision.models.detection import FasterRCNN
-from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
+from torchvision.ops import FeaturePyramidNetwork
+from torchvision.ops.feature_pyramid_network import LastLevelMaxPool
 from torchvision.transforms.functional import to_tensor
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 from tqdm import tqdm
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
-BACKBONE_WEIGHTS = {
-    "resnet18": "IMAGENET1K_V1",
-    "resnet34": "IMAGENET1K_V1",
-    "resnet50": "IMAGENET1K_V2",
-    "resnet101": "IMAGENET1K_V2",
-}
+BACKBONE_CHOICES = ["mobilenetv4_conv_small", "mobilenetv4_conv_medium", "mobilenetv4_conv_large"]
+
+FPN_OUT_INDICES = (1, 2, 3, 4)
 
 
 def get_device():
@@ -36,6 +37,23 @@ def get_device():
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+class MobileNetV4Backbone(nn.Module):
+
+    def __init__(self, backbone_name, out_channels=256):
+        super().__init__()
+        self.body = timm.create_model(
+            backbone_name, pretrained=True, features_only=True, out_indices=FPN_OUT_INDICES,
+        )
+        self.fpn = FeaturePyramidNetwork(
+            self.body.feature_info.channels(), out_channels, extra_blocks=LastLevelMaxPool(),
+        )
+        self.out_channels = out_channels
+
+    def forward(self, x):
+        features = self.body(x)
+        return self.fpn(OrderedDict((str(i), f) for i, f in enumerate(features)))
 
 
 class YoloFormatDataset(Dataset):
@@ -91,11 +109,7 @@ def warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor):
 
 
 def build_model(backbone_name, num_classes):
-    backbone = resnet_fpn_backbone(
-        backbone_name=backbone_name,
-        weights=BACKBONE_WEIGHTS[backbone_name],
-        trainable_layers=3,
-    )
+    backbone = MobileNetV4Backbone(backbone_name)
     return FasterRCNN(backbone, num_classes=num_classes)
 
 
@@ -117,17 +131,17 @@ def evaluate(model, data_loader, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", default="data_detect/data.yaml")
-    parser.add_argument("--backbone", default="resnet50",
-                         choices=["resnet18", "resnet34", "resnet50", "resnet101"])
+    parser.add_argument("--backbone", default="mobilenetv4_conv_medium", choices=BACKBONE_CHOICES)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=0.005)
     parser.add_argument("--workers", type=int, default=4, help="DataLoader worker processes")
-    parser.add_argument("--output", default=None, help="Output path. Defaults to models/resnet_<backbone>_detect_best.pt")
+    parser.add_argument("--output", default=None,
+                         help="Output path. Defaults to models/mobilenetv4_<backbone>_detect_best.pt")
     args = parser.parse_args()
 
     if args.output is None:
-        args.output = f"models/resnet_{args.backbone}_detect_best.pt"
+        args.output = f"models/mobilenetv4_{args.backbone}_detect_best.pt"
 
     data_yaml_path = Path(args.data)
     if not data_yaml_path.exists():
