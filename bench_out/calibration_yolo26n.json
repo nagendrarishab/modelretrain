@@ -1,0 +1,16 @@
+{
+  "model": "yolo26n.pt",
+  "device": "mps",
+  "batch": 16,
+  "epochs_requested": 1,
+  "epochs_completed": 0,
+  "img_size": 640,
+  "params": 2572280,
+  "elapsed_sec": 167.7541949748993,
+  "sec_per_epoch": null,
+  "peak_rss_gb": 0.781778944,
+  "map50": null,
+  "map50_95": null,
+  "box_loss": null,
+  "error": "FileNotFoundError: Image Not Found /Users/shubham.kumar/projects/modelretrain/data_detect/train/images/frame_01816.jpg"
+}
