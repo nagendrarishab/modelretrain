@@ -13,9 +13,17 @@ adds a new box rather than replacing the previous one, so if more than one
 physical box is in frame, they're pre-loaded together - or drag once per
 box yourself.
 
+Images in raw/extra/ are treated as "mixed": instead of one class for the
+whole image, each box gets its own open/closed class - for photos where a
+closed box and an open box both appear in frame together.
+
 Controls:
   drag left mouse button  add a box (suggested boxes, if any, are pre-loaded
                            first - drag again to add more)
+  right-click a box        (raw/extra/ only) toggle that box's class between
+                           open/closed
+  o / c                    (raw/extra/ only) set the class new boxes will get
+                           when drawn - shown in the window title bar
   y / n / Enter            save all boxes currently drawn, move to next
   r                        undo the most recently added box
   s                        skip this image (no label saved, move on)
@@ -40,8 +48,9 @@ from google.genai import types
 from PIL import Image, ImageOps
 from ultralytics import YOLO
 
-CLASSES = ["closed", "open"] 
+CLASSES = ["closed", "open"]
 MAX_DISPLAY = 900
+CLASS_COLORS = {0: (0, 140, 255), 1: (0, 220, 0)}  # index matches CLASSES order
 
 
 class BoxState:
@@ -49,10 +58,10 @@ class BoxState:
         self.dragging = False
         self.start = None
         self.current = None  # in-progress drag rect, not yet committed
-        self.boxes = []  # committed (x1, y1, x2, y2) rects, display pixel coords
+        self.boxes = []  # committed (x1, y1, x2, y2, class_id) rects, display pixel coords
 
 
-def make_mouse_callback(state, disp_w, disp_h):
+def make_mouse_callback(state, disp_w, disp_h, get_class, mixed):
     def clamp(v, lo, hi):
         return max(lo, min(hi, v))
 
@@ -70,13 +79,21 @@ def make_mouse_callback(state, disp_w, disp_h):
             x1, y1 = state.start
             state.current = None
             if abs(x - x1) >= 3 and abs(y - y1) >= 3:  # ignore accidental clicks
-                state.boxes.append((x1, y1, x, y))
+                state.boxes.append((x1, y1, x, y, get_class()))
+        elif event == cv2.EVENT_RBUTTONDOWN and mixed:
+            for i in range(len(state.boxes) - 1, -1, -1):  # topmost (last-drawn) box first
+                bx1, by1, bx2, by2, cid = state.boxes[i]
+                lo_x, hi_x = sorted((bx1, bx2))
+                lo_y, hi_y = sorted((by1, by2))
+                if lo_x <= x <= hi_x and lo_y <= y <= hi_y:
+                    state.boxes[i] = (bx1, by1, bx2, by2, 1 - cid)
+                    break
 
     return callback
 
 
-def rect_to_yolo_line(rect, disp_w, disp_h, class_id):
-    x1, y1, x2, y2 = rect
+def rect_to_yolo_line(box, disp_w, disp_h):
+    x1, y1, x2, y2, class_id = box
     x1, x2 = sorted((x1, x2))
     y1, y2 = sorted((y1, y2))
     cx = (x1 + x2) / 2 / disp_w
@@ -189,20 +206,30 @@ def full_rects_to_display(rects, orig_w, orig_h, disp_w, disp_h):
 
 
 def annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, class_id, window):
+    mixed = class_id is None
+    pending = [0]  # class new boxes get in mixed mode; toggled with o/c
+
     state = BoxState()
     state.boxes.extend(initial_rects)
-    cv2.setMouseCallback(window, make_mouse_callback(state, disp_w, disp_h))
+    cv2.setMouseCallback(
+        window, make_mouse_callback(state, disp_w, disp_h, lambda: class_id if not mixed else pending[0], mixed))
 
     while True:
         frame = base_img.copy()
-        for x1, y1, x2, y2 in state.boxes:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
+        for x1, y1, x2, y2, cid in state.boxes:
+            color = CLASS_COLORS[cid]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            if mixed:
+                cv2.putText(frame, CLASSES[cid], (x1 + 3, max(12, y1 - 4)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
         if state.current:
             x1, y1, x2, y2 = state.current
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 255), 1)
         suggestion_note = f" [{source}: {len(initial_rects)} suggested]" if initial_rects else " [no suggestion]"
         status = f" - {len(state.boxes)} box(es), drag to add another, r=undo last"
-        cv2.putText(frame, f"{path.name} [{CLASSES[class_id]}]{suggestion_note}{status}", (10, 24),
+        label = "mixed" if mixed else CLASSES[class_id]
+        mode_note = f" [pending class: {CLASSES[pending[0]]} (o/c to change, right-click box to toggle)]" if mixed else ""
+        cv2.putText(frame, f"{path.name} [{label}]{suggestion_note}{status}{mode_note}", (10, 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.imshow(window, frame)
         key = cv2.waitKey(20) & 0xFF
@@ -210,11 +237,15 @@ def annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, class_id
         if key in (ord("y"), ord("n"), 13):  # y, n, or Enter - all save+advance
             if not state.boxes:
                 continue  # need at least one box before advancing
-            lines = "".join(rect_to_yolo_line(b, disp_w, disp_h, class_id) for b in state.boxes)
+            lines = "".join(rect_to_yolo_line(b, disp_w, disp_h) for b in state.boxes)
             return ("save", lines)
         if key == ord("r"):
             if state.boxes:
                 state.boxes.pop()
+        elif mixed and key == ord("o"):
+            pending[0] = 1
+        elif mixed and key == ord("c"):
+            pending[0] = 0
         elif key == ord("s"):
             return ("skip", None)
         elif key == ord("b"):
@@ -260,6 +291,11 @@ def main():
         files = sorted((raw_dir / cls).glob("*.jpg")) + sorted((raw_dir / cls).glob("*.jpeg"))
         for f in files:
             items.append((f, class_id, cls))
+    # raw/extra/: photos with both an open and a closed box in frame - class_id
+    # is decided per box during annotation instead of once for the whole image.
+    extra_files = sorted((raw_dir / "extra").glob("*.jpg")) + sorted((raw_dir / "extra").glob("*.jpeg"))
+    for f in extra_files:
+        items.append((f, None, "extra"))
 
     if not args.overwrite:
         pending = [(f, cid, cls) for f, cid, cls in items
@@ -305,7 +341,9 @@ def main():
         if not full_rects:
             print("    generic detector found nothing either; draw manually.")
             source = None
-        initial_rects = full_rects_to_display(full_rects, orig_w, orig_h, disp_w, disp_h)
+        default_class = class_id if class_id is not None else 0
+        initial_rects = [(x1, y1, x2, y2, default_class)
+                          for x1, y1, x2, y2 in full_rects_to_display(full_rects, orig_w, orig_h, disp_w, disp_h)]
 
         action, payload = annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, class_id, window)
 

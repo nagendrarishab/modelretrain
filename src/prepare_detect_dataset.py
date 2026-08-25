@@ -89,29 +89,29 @@ def prepare(raw_dir, labels_dir, out_dir, val_frac, test_frac, seed, dup_thresho
         (out_dir / split / "images").mkdir(parents=True, exist_ok=True)
         (out_dir / split / "labels").mkdir(parents=True, exist_ok=True)
 
-    counts = {}
+    counts = {cls: {"train": 0, "val": 0, "test": 0} for cls in CLASSES + ["extra"]}
     skipped_unlabeled = 0
-    for cls in CLASSES:
+
+    labeled = []  # (path, cls)
+    for cls in CLASSES + ["extra"]:
         all_files = sorted((raw_dir / cls).glob("*.jpg")) + sorted((raw_dir / cls).glob("*.jpeg"))
         files = [f for f in all_files if (labels_dir / cls / (f.stem + ".txt")).exists()]
         skipped_unlabeled += len(all_files) - len(files)
+        labeled.extend((f, cls) for f in files)
 
-        if not files:
-            counts[cls] = {"train": 0, "val": 0, "test": 0}
-            continue
+    if labeled:
+        group_ids = cluster_scenes([f for f, _ in labeled], dup_threshold)
+        group_to_items = defaultdict(list)
+        for (f, cls), g in zip(labeled, group_ids):
+            group_to_items[g].append((f, cls))
+        group_sizes = {g: len(items) for g, items in group_to_items.items()}
 
-        group_ids = cluster_scenes(files, dup_threshold)
-        group_to_files = defaultdict(list)
-        for f, g in zip(files, group_ids):
-            group_to_files[g].append(f)
-        group_sizes = {g: len(fs) for g, fs in group_to_files.items()}
-
-        assignment, split_counts = assign_groups_to_splits(
-            list(group_to_files.keys()), group_sizes, val_frac, test_frac, rng)
-        counts[cls] = split_counts
+        assignment, _ = assign_groups_to_splits(
+            list(group_to_items.keys()), group_sizes, val_frac, test_frac, rng)
 
         for g, split in assignment.items():
-            for f in group_to_files[g]:
+            for f, cls in group_to_items[g]:
+                counts[cls][split] += 1
                 save_exif_corrected(f, out_dir / split / "images" / f.name)
                 shutil.copy2(labels_dir / cls / (f.stem + ".txt"), out_dir / split / "labels" / (f.stem + ".txt"))
 
@@ -135,7 +135,8 @@ def prepare(raw_dir, labels_dir, out_dir, val_frac, test_frac, seed, dup_thresho
     else:
         counts["background"] = {"train": 0, "val": 0, "test": 0}
 
-    print(f"Split counts (scene-group-aware, dup-threshold={dup_threshold}):")
+    print(f"Split counts (scene-group-aware, dedup across closed/open/extra combined, "
+          f"dup-threshold={dup_threshold}):")
     for cls, c in counts.items():
         print(f"  {cls}: {c}")
     if skipped_unlabeled:

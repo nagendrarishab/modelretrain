@@ -2,6 +2,8 @@
     python src/run_camera_yolo_detect.py --model-path models/yolo26n_best.pt --source webcam
     python src/run_camera_yolo_detect.py --model-path models/yolo26n_best.pt --source droidcam \
         --droidcam-ip 192.168.0.107 --droidcam-port 4747
+    python src/run_camera_yolo_detect.py --model-path models/yolo26n_best.pt --source file \
+        --video-path Camera_2026-08-21_17-28-33.mp4 --no-preview
 """
 import argparse
 import logging
@@ -56,6 +58,9 @@ def open_capture(args):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.camera_width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.camera_height)
         source_desc = f"webcam index {args.camera_index}"
+    elif args.source == "file":
+        cap = cv2.VideoCapture(args.video_path)
+        source_desc = f"file {args.video_path}"
     else:
         url = args.droidcam_url or f"http://{args.droidcam_ip}:{args.droidcam_port}/video"
         cap = cv2.VideoCapture(url)
@@ -99,10 +104,16 @@ def main():
     parser.add_argument("--img-size", type=int, default=640)
     parser.add_argument("--conf", type=float, default=0.5,
                          help="minimum confidence to consider the box 'visible' and draw anything")
-    parser.add_argument("--source", choices=["webcam", "droidcam"], default="webcam")
+    parser.add_argument("--source", choices=["webcam", "droidcam", "file"], default="webcam")
     parser.add_argument("--camera-index", type=int, default=0, help="webcam device index")
     parser.add_argument("--camera-width", type=int, default=1920, help="requested capture width (webcam source only)")
     parser.add_argument("--camera-height", type=int, default=1080, help="requested capture height (webcam source only)")
+    parser.add_argument("--video-path", default=None, help="path to an input video file (file source only)")
+    parser.add_argument("--output-path", default=None,
+                         help="if set, write the annotated frames out to this video file (file source only, "
+                              "defaults to <video-path stem>_annotated.mp4)")
+    parser.add_argument("--no-preview", action="store_true",
+                         help="don't open a live cv2 preview window (file source only)")
     parser.add_argument("--save-dir", default=None,
                          help="if set, periodically save raw (undetected) frames here for later dataset curation")
     parser.add_argument("--save-interval", type=float, default=2.0,
@@ -120,6 +131,10 @@ def main():
 
     setup_logging(args.log_dir)
 
+    if args.source == "file":
+        if not args.video_path or not Path(args.video_path).exists():
+            raise FileNotFoundError(f"No video file at '{args.video_path}'.")
+
     if not Path(args.model_path).exists():
         raise FileNotFoundError(
             f"No checkpoint at '{args.model_path}'."
@@ -134,6 +149,7 @@ def main():
     window = "Box Detector - YOLO (q to quit)"
     last_log_time = 0.0
     last_save_time = 0.0
+    show_preview = not (args.source == "file" and args.no_preview)
 
     save_dir = None
     if args.save_dir:
@@ -141,10 +157,24 @@ def main():
         save_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Saving raw frames to {save_dir} every {args.save_interval}s")
 
+    writer = None
+    output_path = None
+    if args.source == "file":
+        output_path = Path(args.output_path) if args.output_path else Path(args.video_path).with_name(
+            f"{Path(args.video_path).stem}_annotated.mp4")
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        logger.info(f"Writing annotated video to {output_path}")
+
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
+                if args.source == "file":
+                    logger.info("Reached end of video.")
+                    break
                 logger.warning("Lost the video stream, retrying...")
                 cap.release()
                 time.sleep(args.reconnect_delay)
@@ -164,11 +194,18 @@ def main():
                 log_detections(result)
                 last_log_time = now
 
-            cv2.imshow(window, frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+            if writer is not None:
+                writer.write(frame)
+
+            if show_preview:
+                cv2.imshow(window, frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
     finally:
         cap.release()
+        if writer is not None:
+            writer.release()
+            logger.info(f"Saved annotated video to {output_path}")
         cv2.destroyAllWindows()
 
 
