@@ -139,6 +139,14 @@ def main():
     parser.add_argument("--cache", default="ram", choices=["ram", "disk", "none"],
                          help="cache decoded images after the first epoch to avoid re-reading/decoding "
                               "from disk every epoch (keeps the GPU fed); 'none' disables caching")
+    parser.add_argument("--patience", type=int, default=0,
+                         help="stop training early if val mAP doesn't improve for this many epochs; "
+                              "0 disables early stopping and always runs the full --epochs")
+    parser.add_argument("--freeze", type=int, default=0,
+                         help="freeze (skip backprop through) the first N backbone layers, so only the "
+                              "later layers/head are fine-tuned - faster per epoch, useful when the "
+                              "pretrained backbone already extracts good enough features for this task; "
+                              "0 trains every layer")
     args = parser.parse_args()
     args.cache = False if args.cache == "none" else args.cache
 
@@ -167,6 +175,8 @@ def main():
         scale=args.scale,
         perspective=args.perspective,
         cache=args.cache,
+        patience=args.patience,
+        freeze=args.freeze,
         name="box_open_closed_yolo_detect",
         exist_ok=True,
     )
