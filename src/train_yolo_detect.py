@@ -180,9 +180,6 @@ def main():
     parser.add_argument("--save-period", type=int, default=-1,
                          help="also save a numbered checkpoint (weights/epochN.pt) every N epochs, "
                               "on top of the continuously-updated best.pt/last.pt; -1 disables this")
-    parser.add_argument("--workers", type=int, default=8,
-                         help="dataloader worker threads; each one holds its own prefetch buffer in "
-                              "RAM, so lower this on a memory-constrained or shared machine")
     parser.add_argument("--resume", default=None,
                          help="path to a last.pt checkpoint to resume an interrupted run from "
                               "(model weights, optimizer state, and epoch count are restored)")
@@ -245,7 +242,6 @@ def main():
         freeze=args.freeze,
         time=args.time,
         save_period=args.save_period,
-        workers=args.workers,
         plots=not args.no_plots,
         fraction=args.fraction,
         cos_lr=args.cos_lr,
