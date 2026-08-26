@@ -109,12 +109,16 @@ def log_detections(result):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", default="models/yolo26n_best.pt")
+    parser.add_argument("--export-format", default=None,
+                         help="export --model-path to this format (e.g. ncnn) and exit, instead of running")
     parser.add_argument("--img-size", type=int, default=640)
     parser.add_argument("--conf", type=float, default=0.5,
                          help="minimum confidence to consider the box 'visible' and draw anything")
-    parser.add_argument("--quantize", default=None,
-                         help="inference precision, e.g. 16 for FP16 - speeds up per-frame inference "
-                              "(most noticeable on CUDA; smaller gains on MPS/CPU) at a small accuracy cost")
+    parser.add_argument("--quantize", default=16,
+                         help="inference precision, e.g. 16 for FP16 or 32/None for FP32 - FP16 is the "
+                              "default since it speeds up per-frame inference (most noticeable on CUDA; "
+                              "smaller gains on MPS/CPU) for a negligible accuracy cost; pass --quantize 32 "
+                              "to disable if you need exact FP32 parity")
     parser.add_argument("--max-det", type=int, default=10,
                          help="cap on detections per frame; this is a 1-2 object scene (open/closed box) "
                               "so the default 300 just wastes NMS time on candidates that will never matter")
@@ -168,6 +172,12 @@ def main():
     device = str(get_device())
     logger.info(f"Using device: {device}")
     model = YOLO(args.model_path)
+
+    if args.export_format:
+        exported_path = model.export(format=args.export_format, half=True)
+        logger.info(f"Exported to {exported_path}")
+        return
+
     logger.info(f"Loaded model, classes: {model.names}, confidence threshold: {args.conf:.0%}")
 
     cap = open_capture(args)
