@@ -1,5 +1,9 @@
 """
     python src/train_yolo_detect.py --model yolo26n.pt --epochs 50
+
+    # resume a run that got killed partway through (points at its last.pt)
+    python src/train_yolo_detect.py --model yolo26n.pt --epochs 50 \
+        --resume runs/detect/box_open_closed_yolo_detect/weights/last.pt
 """
 import argparse
 import os
@@ -147,6 +151,31 @@ def main():
                               "later layers/head are fine-tuned - faster per epoch, useful when the "
                               "pretrained backbone already extracts good enough features for this task; "
                               "0 trains every layer")
+    parser.add_argument("--time", type=float, default=None,
+                         help="max training time in hours; overrides --epochs once reached, "
+                              "so a run always wraps up by a known deadline")
+    parser.add_argument("--save-period", type=int, default=-1,
+                         help="also save a numbered checkpoint (weights/epochN.pt) every N epochs, "
+                              "on top of the continuously-updated best.pt/last.pt; -1 disables this")
+    parser.add_argument("--workers", type=int, default=8,
+                         help="dataloader worker threads; each one holds its own prefetch buffer in "
+                              "RAM, so lower this on a memory-constrained or shared machine")
+    parser.add_argument("--resume", default=None,
+                         help="path to a last.pt checkpoint to resume an interrupted run from "
+                              "(model weights, optimizer state, and epoch count are restored)")
+    parser.add_argument("--name", default="box_open_closed_yolo_detect",
+                         help="run name; outputs go to runs/detect/<name>")
+    parser.add_argument("--exist-ok", action="store_true",
+                         help="overwrite an existing run directory with this --name instead of "
+                              "keeping each run's args/weights/logs separate")
+    parser.add_argument("--no-plots", action="store_true",
+                         help="skip generating training curve/confusion-matrix plots at the end "
+                              "of the run (saves memory right after training finishes)")
+    parser.add_argument("--fraction", type=float, default=1.0,
+                         help="train on only this fraction of the dataset - use a small value "
+                              "(e.g. 0.05) for a quick smoke test before committing to a full run")
+    parser.add_argument("--cos-lr", action="store_true",
+                         help="use a cosine learning-rate schedule instead of the default linear one")
     args = parser.parse_args()
     args.cache = False if args.cache == "none" else args.cache
 
@@ -165,8 +194,8 @@ def main():
     device = str(get_device())
     print(f"Using device: {device}")
 
-    model = YOLO(args.model)
-    train_results = model.train(
+    model = YOLO(args.resume or args.model)
+    train_kwargs = dict(
         data=str(Path(args.data).resolve()),
         epochs=args.epochs,
         imgsz=args.img_size,
@@ -177,9 +206,18 @@ def main():
         cache=args.cache,
         patience=args.patience,
         freeze=args.freeze,
-        name="box_open_closed_yolo_detect",
-        exist_ok=True,
+        time=args.time,
+        save_period=args.save_period,
+        workers=args.workers,
+        plots=not args.no_plots,
+        fraction=args.fraction,
+        cos_lr=args.cos_lr,
+        name=args.name,
+        exist_ok=args.exist_ok,
     )
+    if args.resume:
+        train_kwargs["resume"] = True
+    train_results = model.train(**train_kwargs)
 
     save_dir = Path(getattr(train_results, "save_dir", None) or model.trainer.save_dir)
     best_ckpt = save_dir / "weights" / "best.pt"

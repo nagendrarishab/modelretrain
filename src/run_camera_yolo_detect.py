@@ -4,6 +4,14 @@
         --droidcam-ip 192.168.0.107 --droidcam-port 4747
     python src/run_camera_yolo_detect.py --model-path models/yolo26n_best.pt --source file \
         --video-path Camera_2026-08-21_17-28-33.mp4 --no-preview
+
+    # FP16 inference for a faster per-frame loop (biggest win on CUDA, smaller on MPS/CPU)
+    python src/run_camera_yolo_detect.py --model-path models/yolo26n_best.pt --quantize 16
+
+    # tighten/loosen detection behavior: dedup overlapping boxes, keep only class 0,
+    # and save a crop of every detection for later re-annotation
+    python src/run_camera_yolo_detect.py --model-path models/yolo26n_best.pt \
+        --iou 0.5 --classes 0 --agnostic-nms --save-crop
 """
 import argparse
 import logging
@@ -104,6 +112,23 @@ def main():
     parser.add_argument("--img-size", type=int, default=640)
     parser.add_argument("--conf", type=float, default=0.5,
                          help="minimum confidence to consider the box 'visible' and draw anything")
+    parser.add_argument("--quantize", default=None,
+                         help="inference precision, e.g. 16 for FP16 - speeds up per-frame inference "
+                              "(most noticeable on CUDA; smaller gains on MPS/CPU) at a small accuracy cost")
+    parser.add_argument("--max-det", type=int, default=10,
+                         help="cap on detections per frame; this is a 1-2 object scene (open/closed box) "
+                              "so the default 300 just wastes NMS time on candidates that will never matter")
+    parser.add_argument("--iou", type=float, default=0.7,
+                         help="IoU threshold for NMS; lower it if the same box is being reported twice")
+    parser.add_argument("--classes", type=int, nargs="+", default=None,
+                         help="restrict detections to these class IDs (e.g. --classes 0 1); "
+                              "default keeps every class the model knows")
+    parser.add_argument("--agnostic-nms", action="store_true",
+                         help="suppress overlapping boxes across different classes, not just within "
+                              "the same class - use if 'open' and 'closed' both fire on the same box")
+    parser.add_argument("--save-crop", action="store_true",
+                         help="save a cropped image of each detection under runs/detect/predict*/crops/ "
+                              "- useful for feeding auto_annotate_bboxes.py with fresh training candidates")
     parser.add_argument("--source", choices=["webcam", "droidcam", "file"], default="webcam")
     parser.add_argument("--camera-index", type=int, default=0, help="webcam device index")
     parser.add_argument("--camera-width", type=int, default=1920, help="requested capture width (webcam source only)")
@@ -187,7 +212,11 @@ def main():
                 cv2.imwrite(str(frame_path), frame)
                 last_save_time = now
 
-            result = model.predict(frame, imgsz=args.img_size, conf=args.conf, device=device, verbose=False)[0]
+            result = model.predict(
+                frame, imgsz=args.img_size, conf=args.conf, device=device, verbose=False,
+                quantize=args.quantize, max_det=args.max_det, iou=args.iou,
+                classes=args.classes, agnostic_nms=args.agnostic_nms, save_crop=args.save_crop,
+            )[0]
             draw_detections(frame, result)
 
             if now - last_log_time >= args.log_interval:
