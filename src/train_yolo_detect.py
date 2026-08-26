@@ -4,6 +4,11 @@
     # resume a run that got killed partway through (points at its last.pt)
     python src/train_yolo_detect.py --model yolo26n.pt --epochs 50 \
         --resume runs/detect/box_open_closed_yolo_detect/weights/last.pt
+
+    # lighting/scale augmentation (hsv-v, hsv-s, multi-scale) is on by default;
+    # disable multi-scale or override the hsv strengths if needed, e.g.:
+    python src/train_yolo_detect.py --model yolo26n.pt --epochs 50 --no-multi-scale
+    python src/train_yolo_detect.py --model yolo26n.pt --epochs 50 --hsv-v 0.8
 """
 import argparse
 import os
@@ -136,6 +141,24 @@ def main():
                               "aggressive zoom-out, i.e. more training views of the box looking small/far away")
     parser.add_argument("--perspective", type=float, default=0.0005,
                          help="random perspective warp strength (Ultralytics 'perspective' aug)")
+    parser.add_argument("--hsv-h", type=float, default=0.015,
+                         help="random hue jitter (Ultralytics 'hsv_h' aug)")
+    parser.add_argument("--hsv-s", type=float, default=0.8,
+                         help="random saturation jitter (Ultralytics 'hsv_s' aug); raised from the "
+                              "Ultralytics default of 0.7 since washed-out/oversaturated lighting is "
+                              "part of the lighting variation this model needs to be robust to")
+    parser.add_argument("--hsv-v", type=float, default=0.6,
+                         help="random brightness/value jitter (Ultralytics 'hsv_v' aug); raised from the "
+                              "Ultralytics default of 0.4 because predictions are sensitive to lighting "
+                              "changes - this forces the model to see much darker/brighter versions of "
+                              "every training image")
+    parser.add_argument("--mixup", type=float, default=0.0,
+                         help="probability of blending two training images together (Ultralytics 'mixup' "
+                              "aug); 0 disables it")
+    parser.add_argument("--multi-scale", action=argparse.BooleanOptionalAction, default=True,
+                         help="randomly resize images between 0.5x-1.5x --img-size each batch, so the "
+                              "model sees the box at more distances/scales; pass --no-multi-scale to "
+                              "disable (costs some training speed/memory for the larger scales)")
     parser.add_argument("--output", default=None, help="Output path. Defaults to models/<model_name>_best.pt")
     parser.add_argument("--min-samples-per-class", type=int, default=50,
                          help="classes with fewer annotations than this are dropped (and remaining "
@@ -176,6 +199,15 @@ def main():
                               "(e.g. 0.05) for a quick smoke test before committing to a full run")
     parser.add_argument("--cos-lr", action="store_true",
                          help="use a cosine learning-rate schedule instead of the default linear one")
+    parser.add_argument("--tta", action="store_true",
+                         help="use test-time augmentation (multi-scale + flip, averaged) for the final "
+                              "test-set eval - costs eval latency for a small mAP bump, doesn't affect "
+                              "training or the saved weights")
+    parser.add_argument("--conf", type=float, default=0.001,
+                         help="confidence threshold for the final test-set eval; lower keeps more "
+                              "low-confidence predictions when computing mAP/PR curves")
+    parser.add_argument("--iou", type=float, default=0.7,
+                         help="NMS IoU threshold for the final test-set eval")
     args = parser.parse_args()
     args.cache = False if args.cache == "none" else args.cache
 
@@ -203,6 +235,11 @@ def main():
         device=device,
         scale=args.scale,
         perspective=args.perspective,
+        hsv_h=args.hsv_h,
+        hsv_s=args.hsv_s,
+        hsv_v=args.hsv_v,
+        mixup=args.mixup,
+        multi_scale=args.multi_scale,
         cache=args.cache,
         patience=args.patience,
         freeze=args.freeze,
@@ -227,7 +264,15 @@ def main():
     print(f"Saved best model to {args.output} (full run artifacts in {save_dir})")
 
     best_model = YOLO(str(best_ckpt))
-    metrics = best_model.val(data=str(Path(args.data).resolve()), split="test", imgsz=args.img_size, device=device)
+    metrics = best_model.val(
+        data=str(Path(args.data).resolve()),
+        split="test",
+        imgsz=args.img_size,
+        device=device,
+        augment=args.tta,
+        conf=args.conf,
+        iou=args.iou,
+    )
     print(f"\nTest mAP50: {metrics.box.map50:.4f}  mAP50-95: {metrics.box.map:.4f}")
     print(f"Full report saved under: {metrics.save_dir}")
 
