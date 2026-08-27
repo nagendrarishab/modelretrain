@@ -1,14 +1,9 @@
 .venv/
 __pycache__/
 *.pyc
-data_detect/
-models/
 runs/
-*.pt
 .DS_Store
 .env
-raw/
-raw_labels/
 models_tested/
 data_source_video/
 *.mp4
@@ -17,3 +12,9 @@ logs/
 *.zip
 .ipynb_checkpoints/
 bench_out/
+models/yolo26n_best_ncnn_model
+models/yolo26n_best.onnx
+yolo26*.pt
+raw/
+raw_labels/
+/data_detect
