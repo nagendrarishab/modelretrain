@@ -33,8 +33,6 @@ BACKBONE_WEIGHTS = {
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
     return torch.device("cpu")
 
 
@@ -90,13 +88,33 @@ def warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, f)
 
 
-def build_model(backbone_name, num_classes):
+def offload_to_device(module, device):
+    module.to(device)
+    original_forward = module.forward
+
+    def forward(x):
+        output = original_forward(x.to(device))
+        return {key: value.to("cpu") for key, value in output.items()}
+
+    module.forward = forward
+    return module
+
+
+def build_model(backbone_name, num_classes, backbone_device=None,
+                min_size=800, max_size=1333):
     backbone = resnet_fpn_backbone(
         backbone_name=backbone_name,
         weights=BACKBONE_WEIGHTS[backbone_name],
         trainable_layers=3,
     )
-    return FasterRCNN(backbone, num_classes=num_classes)
+    if backbone_device is not None:
+        offload_to_device(backbone, backbone_device)
+    return FasterRCNN(
+        backbone,
+        num_classes=num_classes,
+        min_size=min_size,
+        max_size=max_size,
+    )
 
 
 @torch.no_grad()
@@ -123,6 +141,10 @@ def main():
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=0.005)
     parser.add_argument("--workers", type=int, default=4, help="DataLoader worker processes")
+    parser.add_argument("--min-size", type=int, default=320,
+                        help="Shorter image side after resize")
+    parser.add_argument("--max-size", type=int, default=569,
+                        help="Longer image side cap after resize")
     parser.add_argument("--output", default=None, help="Output path. Defaults to models/resnet_<backbone>_detect_best.pt")
     args = parser.parse_args()
 
@@ -140,9 +162,15 @@ def main():
     num_classes = len(class_names) + 1  # +1 for background
 
     device = get_device()
+    backbone_device = None
+    if device.type == "cpu" and torch.backends.mps.is_available():
+        backbone_device = torch.device("mps")
+        print(f"Using device: {device} (backbone offloaded to {backbone_device}, "
+              "RPN/ROI heads stay on CPU)")
+    else:
+        print(f"Using device: {device}")
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
-    print(f"Using device: {device}")
 
     loader_kwargs = dict(
         collate_fn=collate_fn,
@@ -165,7 +193,15 @@ def main():
     print(f"Train: {len(train_loader.dataset)} images ({len(train_loader)} batches/epoch)  "
           f"Val: {len(val_loader.dataset)}  Test: {len(test_loader.dataset)}")
 
-    model = build_model(args.backbone, num_classes).to(device)
+    model = build_model(
+        args.backbone,
+        num_classes,
+        backbone_device=backbone_device,
+        min_size=args.min_size,
+        max_size=args.max_size,
+    )
+    if backbone_device is None:
+        model = model.to(device)
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=0.0005)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(args.epochs // 3, 1), gamma=0.1)
@@ -199,8 +235,8 @@ def main():
                 breakdown = ", ".join(f"{k}={v.item():.4f}" for k, v in loss_dict.items())
                 raise RuntimeError(
                     f"Loss went non-finite ({breakdown}) on device={device}. "
-                    f"This is the known Faster R-CNN/MPS instability - rerun with a CPU-only "
-                    f"get_device() (or on CUDA) if it recurs."
+                    f"This can result from Faster R-CNN/MPS instability; rerun with "
+                    f"--workers 0 or on CUDA if it recurs."
                 )
 
             optimizer.zero_grad()
@@ -226,7 +262,15 @@ def main():
     print(f"\nSaved best model to {args.output} (val mAP50={best_map50:.4f})")
 
     best = torch.load(args.output, map_location=device, weights_only=False)
-    model = build_model(best["backbone"], len(best["class_names"]) + 1).to(device)
+    model = build_model(
+        best["backbone"],
+        len(best["class_names"]) + 1,
+        backbone_device=backbone_device,
+        min_size=args.min_size,
+        max_size=args.max_size,
+    )
+    if backbone_device is None:
+        model = model.to(device)
     model.load_state_dict(best["model_state_dict"])
     test_map50, test_map5095 = evaluate(model, test_loader, device)
     print(f"Test mAP50: {test_map50:.4f}  mAP50-95: {test_map5095:.4f}")
