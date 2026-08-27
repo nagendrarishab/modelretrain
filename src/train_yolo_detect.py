@@ -5,10 +5,12 @@
     python src/train_yolo_detect.py --model yolo26n.pt --epochs 50 \
         --resume runs/detect/box_open_closed_yolo_detect/weights/last.pt
 
-    # lighting/scale augmentation (hsv-v, hsv-s, multi-scale) is on by default;
-    # disable multi-scale or override the hsv strengths if needed, e.g.:
-    python src/train_yolo_detect.py --model yolo26n.pt --epochs 50 --no-multi-scale
+    # lighting augmentation (hsv-v, hsv-s) is on by default; override the strengths if needed:
     python src/train_yolo_detect.py --model yolo26n.pt --epochs 50 --hsv-v 0.8
+
+    # --multi-scale is off by default (pathologically slow on MPS - see its --help text);
+    # only turn it on if you're training on CUDA
+    python src/train_yolo_detect.py --model yolo26n.pt --epochs 50 --multi-scale
 """
 import argparse
 import os
@@ -155,10 +157,15 @@ def main():
     parser.add_argument("--mixup", type=float, default=0.0,
                          help="probability of blending two training images together (Ultralytics 'mixup' "
                               "aug); 0 disables it")
-    parser.add_argument("--multi-scale", action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument("--multi-scale", action=argparse.BooleanOptionalAction, default=False,
                          help="randomly resize images between 0.5x-1.5x --img-size each batch, so the "
-                              "model sees the box at more distances/scales; pass --no-multi-scale to "
-                              "disable (costs some training speed/memory for the larger scales)")
+                              "model sees the box at more distances/scales. Off by default: on MPS "
+                              "(Apple GPU) this is pathologically slow - MPS compiles/optimizes its "
+                              "compute graph per input shape, and a different shape every batch means "
+                              "recompiling every batch; measured ~96s/it (mostly recompile overhead, "
+                              "not real compute) vs ~1s/it with this off, on a 2.5M-param nano model. "
+                              "Fine to enable on CUDA, where this recompilation cost doesn't apply the "
+                              "same way; pass --multi-scale to turn it on")
     parser.add_argument("--output", default=None, help="Output path. Defaults to models/<model_name>_best.pt")
     parser.add_argument("--min-samples-per-class", type=int, default=50,
                          help="classes with fewer annotations than this are dropped (and remaining "
