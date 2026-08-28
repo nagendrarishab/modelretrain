@@ -18,3 +18,4 @@ yolo26*.pt
 raw/
 raw_labels/
 /data_detect
+*.ipynb

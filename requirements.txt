@@ -3,6 +3,8 @@ torchvision
 timm
 torchmetrics
 pycocotools
+tensorflow
+keras-hub
 tqdm
 ultralytics
 opencv-python

@@ -268,6 +268,9 @@ def main():
     parser.add_argument("--detector-conf", type=float, default=0.25,
                          help="confidence threshold for the fallback detector")
     parser.add_argument("--overwrite", action="store_true", help="re-annotate images that already have a label")
+    parser.add_argument("--start-after", default=None,
+                         help="resume an --overwrite pass: skip images up to and including this filename "
+                              "(e.g. IMG-20260811-WA0002.jpg), which is the last one you finished last run")
     parser.add_argument("--skip-vlm", action="store_true",
                          help="go straight to the local detector fallback, e.g. while the VLM's free quota is exhausted")
     args = parser.parse_args()
@@ -305,6 +308,16 @@ def main():
 
     total = len(items)
     print(f"{len(pending)}/{total} images need annotation (already-labeled ones are skipped; use --overwrite to redo).")
+
+    if args.start_after:
+        names = [f.name for f, _, _ in pending]
+        try:
+            resume_at = names.index(args.start_after) + 1
+        except ValueError:
+            raise SystemExit(f"--start-after {args.start_after!r} not found among the pending images.")
+        pending = pending[resume_at:]
+        print(f"Resuming after {args.start_after}: {len(pending)} left.")
+
     if not pending:
         print("Nothing to do.")
         return

@@ -5,17 +5,19 @@
     python src/train_yolo_detect.py --model yolo26n.pt --epochs 50 \
         --resume runs/detect/box_open_closed_yolo_detect/weights/last.pt
 
-    # lighting augmentation (hsv-v, hsv-s) is on by default; override the strengths if needed:
-    python src/train_yolo_detect.py --model yolo26n.pt --epochs 50 --hsv-v 0.8
+    # hsv-v/hsv-s are back to Ultralytics' plain defaults (0.4/0.7) - raising them didn't
+    # help real lighting sensitivity and correlated with more false positives, see their --help text
 
     # --multi-scale is off by default (pathologically slow on MPS - see its --help text);
     # only turn it on if you're training on CUDA
     python src/train_yolo_detect.py --model yolo26n.pt --epochs 50 --multi-scale
 """
 import argparse
+import json
 import os
 import shutil
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 import certifi
@@ -145,15 +147,18 @@ def main():
                          help="random perspective warp strength (Ultralytics 'perspective' aug)")
     parser.add_argument("--hsv-h", type=float, default=0.015,
                          help="random hue jitter (Ultralytics 'hsv_h' aug)")
-    parser.add_argument("--hsv-s", type=float, default=0.8,
-                         help="random saturation jitter (Ultralytics 'hsv_s' aug); raised from the "
-                              "Ultralytics default of 0.7 since washed-out/oversaturated lighting is "
-                              "part of the lighting variation this model needs to be robust to")
-    parser.add_argument("--hsv-v", type=float, default=0.6,
-                         help="random brightness/value jitter (Ultralytics 'hsv_v' aug); raised from the "
-                              "Ultralytics default of 0.4 because predictions are sensitive to lighting "
-                              "changes - this forces the model to see much darker/brighter versions of "
-                              "every training image")
+    parser.add_argument("--hsv-s", type=float, default=0.7,
+                         help="random saturation jitter (Ultralytics 'hsv_s' aug); Ultralytics default. "
+                              "Previously raised to 0.8 to try to help with lighting sensitivity, reverted "
+                              "- this is a symmetric jitter around the *existing* raw photos, which never "
+                              "include a genuinely bright/washed-out example, so widening it just added "
+                              "synthetic variance without teaching real overexposure and correlated with "
+                              "more false positives. Fix real brightness sensitivity by adding real "
+                              "bright-condition photos to raw/open, raw/closed instead")
+    parser.add_argument("--hsv-v", type=float, default=0.4,
+                         help="random brightness/value jitter (Ultralytics 'hsv_v' aug); Ultralytics "
+                              "default. Previously raised to 0.6 for the same reason and reverted for "
+                              "the same reason - see --hsv-s's help text")
     parser.add_argument("--mixup", type=float, default=0.0,
                          help="probability of blending two training images together (Ultralytics 'mixup' "
                               "aug); 0 disables it")
@@ -275,9 +280,50 @@ def main():
         augment=args.tta,
         conf=args.conf,
         iou=args.iou,
+        plots=True,  # needed for metrics.confusion_matrix.matrix to actually be populated
     )
     print(f"\nTest mAP50: {metrics.box.map50:.4f}  mAP50-95: {metrics.box.map:.4f}")
     print(f"Full report saved under: {metrics.save_dir}")
+
+    class_names = [metrics.names[i] for i in sorted(metrics.names)]
+    log_entry = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "run_name": args.name,
+        "model": args.model,
+        "output": args.output,
+        "run_dir": str(save_dir),
+        "epochs_requested": args.epochs,
+        "batch_size": args.batch_size,
+        "img_size": args.img_size,
+        "cache": args.cache,
+        "patience": args.patience,
+        "freeze": args.freeze,
+        "fraction": args.fraction,
+        "augmentation": {
+            "scale": args.scale,
+            "perspective": args.perspective,
+            "hsv_h": args.hsv_h,
+            "hsv_s": args.hsv_s,
+            "hsv_v": args.hsv_v,
+            "mixup": args.mixup,
+            "multi_scale": args.multi_scale,
+            "cos_lr": args.cos_lr,
+        },
+        "test_map50": float(metrics.box.map50),
+        "test_map50_95": float(metrics.box.map),
+        "per_class_ap50": dict(zip(class_names, (float(x) for x in metrics.box.ap50))),
+        "per_class_precision": dict(zip(class_names, (float(x) for x in metrics.box.p))),
+        "per_class_recall": dict(zip(class_names, (float(x) for x in metrics.box.r))),
+        "confusion_matrix": {
+            "labels": [*class_names, "background"],
+            "matrix": metrics.confusion_matrix.matrix.tolist(),
+        },
+    }
+    log_path = Path("logs/train_runs.jsonl")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a") as f:
+        f.write(json.dumps(log_entry) + "\n")
+    print(f"Logged run summary to {log_path}")
 
 
 if __name__ == "__main__":
