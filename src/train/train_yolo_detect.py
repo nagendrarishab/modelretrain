@@ -13,11 +13,9 @@
     python src/train_yolo_detect.py --model yolo26n.pt --epochs 50 --multi-scale
 """
 import argparse
-import json
 import os
 import shutil
 from collections import Counter
-from datetime import datetime
 from pathlib import Path
 
 import certifi
@@ -284,46 +282,6 @@ def main():
     )
     print(f"\nTest mAP50: {metrics.box.map50:.4f}  mAP50-95: {metrics.box.map:.4f}")
     print(f"Full report saved under: {metrics.save_dir}")
-
-    class_names = [metrics.names[i] for i in sorted(metrics.names)]
-    log_entry = {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "run_name": args.name,
-        "model": args.model,
-        "output": args.output,
-        "run_dir": str(save_dir),
-        "epochs_requested": args.epochs,
-        "batch_size": args.batch_size,
-        "img_size": args.img_size,
-        "cache": args.cache,
-        "patience": args.patience,
-        "freeze": args.freeze,
-        "fraction": args.fraction,
-        "augmentation": {
-            "scale": args.scale,
-            "perspective": args.perspective,
-            "hsv_h": args.hsv_h,
-            "hsv_s": args.hsv_s,
-            "hsv_v": args.hsv_v,
-            "mixup": args.mixup,
-            "multi_scale": args.multi_scale,
-            "cos_lr": args.cos_lr,
-        },
-        "test_map50": float(metrics.box.map50),
-        "test_map50_95": float(metrics.box.map),
-        "per_class_ap50": dict(zip(class_names, (float(x) for x in metrics.box.ap50))),
-        "per_class_precision": dict(zip(class_names, (float(x) for x in metrics.box.p))),
-        "per_class_recall": dict(zip(class_names, (float(x) for x in metrics.box.r))),
-        "confusion_matrix": {
-            "labels": [*class_names, "background"],
-            "matrix": metrics.confusion_matrix.matrix.tolist(),
-        },
-    }
-    log_path = Path("logs/train_runs.jsonl")
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_path, "a") as f:
-        f.write(json.dumps(log_entry) + "\n")
-    print(f"Logged run summary to {log_path}")
 
 
 if __name__ == "__main__":
