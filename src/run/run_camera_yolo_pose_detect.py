@@ -2,6 +2,28 @@
     python src/run_camera_yolo_pose_detect.py --model-path models/yolo26n-pose_best.pt --source webcam
     python src/run_camera_yolo_pose_detect.py --model-path models/yolo26n-pose_best.pt --source droidcam \
         --droidcam-ip 192.168.0.107 --droidcam-port 4747
+    python src/run_camera_yolo_pose_detect.py --model-path models/yolo26n-pose_best.pt --source file \
+        --video-path Camera_2026-08-21_17-28-33.mp4 --no-preview
+
+    # export to NCNN for Raspberry Pi deployment (fp16), then exit - same format
+    # already used for the sibling models/yolo26n_best_ncnn_model/
+    python src/run_camera_yolo_pose_detect.py --model-path models/yolo26n-pose_best.pt --export-format ncnn
+
+    # FP16 inference for a faster per-frame loop (biggest win on CUDA, smaller on MPS/CPU)
+    python src/run_camera_yolo_pose_detect.py --model-path models/yolo26n-pose_best.pt --quantize 16
+
+    # tighten/loosen detection behavior: dedup overlapping boxes, keep only class 0,
+    # and save a crop of every detection for later re-annotation
+    python src/run_camera_yolo_pose_detect.py --model-path models/yolo26n-pose_best.pt \
+        --iou 0.5 --classes 0 --agnostic-nms --save-crop
+
+Same run-time settings surface as run_camera_yolo_detect.py - this is still
+a plain Ultralytics YOLO().predict() call, just on a pose model instead of
+a detect model, so every Predictor-level setting (quantize/max-det/iou/
+classes/agnostic-nms/save-crop) applies identically, and result.boxes is
+still populated (pose results carry both result.boxes and result.keypoints).
+See run_camera_yolo_detect.py's docstring/--help for the per-setting
+rationale; not repeated here.
 """
 import argparse
 import logging
@@ -59,6 +81,9 @@ def open_capture(args):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.camera_width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.camera_height)
         source_desc = f"webcam index {args.camera_index}"
+    elif args.source == "file":
+        cap = cv2.VideoCapture(args.video_path)
+        source_desc = f"file {args.video_path}"
     else:
         url = args.droidcam_url or f"http://{args.droidcam_ip}:{args.droidcam_port}/video"
         cap = cv2.VideoCapture(url)
@@ -112,17 +137,44 @@ def log_detections(result):
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model-path", default="models/yolo26n-pose_best.pt")
+    parser.add_argument("--export-format", default=None,
+                         help="export --model-path to this format (e.g. ncnn) and exit, instead of running")
     parser.add_argument("--img-size", type=int, default=640)
     parser.add_argument("--conf", type=float, default=0.5,
                          help="minimum confidence to consider the box 'visible' and draw anything - "
                               "also used to skip drawing a corner-to-corner edge if either keypoint's "
                               "confidence falls below it")
-    parser.add_argument("--source", choices=["webcam", "droidcam"], default="webcam")
+    parser.add_argument("--quantize", default=16,
+                         help="inference precision, e.g. 16 for FP16 or 32/None for FP32 - FP16 is the "
+                              "default since it speeds up per-frame inference (most noticeable on CUDA; "
+                              "smaller gains on MPS/CPU) for a negligible accuracy cost; pass --quantize 32 "
+                              "to disable if you need exact FP32 parity")
+    parser.add_argument("--max-det", type=int, default=10,
+                         help="cap on detections per frame; this is a 1-2 object scene (open/closed box) "
+                              "so the default 300 just wastes NMS time on candidates that will never matter")
+    parser.add_argument("--iou", type=float, default=0.7,
+                         help="IoU threshold for NMS; lower it if the same box is being reported twice")
+    parser.add_argument("--classes", type=int, nargs="+", default=None,
+                         help="restrict detections to these class IDs (e.g. --classes 0 1); "
+                              "default keeps every class the model knows")
+    parser.add_argument("--agnostic-nms", action="store_true",
+                         help="suppress overlapping boxes across different classes, not just within "
+                              "the same class - use if 'open' and 'closed' both fire on the same box")
+    parser.add_argument("--save-crop", action="store_true",
+                         help="save a cropped image of each detection under runs/pose/predict*/crops/ "
+                              "- useful for feeding auto_annotate_bboxes.py with fresh training candidates")
+    parser.add_argument("--source", choices=["webcam", "droidcam", "file"], default="webcam")
     parser.add_argument("--camera-index", type=int, default=0, help="webcam device index")
     parser.add_argument("--camera-width", type=int, default=1920, help="requested capture width (webcam source only)")
     parser.add_argument("--camera-height", type=int, default=1080, help="requested capture height (webcam source only)")
+    parser.add_argument("--video-path", default=None, help="path to an input video file (file source only)")
+    parser.add_argument("--output-path", default=None,
+                         help="if set, write the annotated frames out to this video file (file source only, "
+                              "defaults to <video-path stem>_annotated.mp4)")
+    parser.add_argument("--no-preview", action="store_true",
+                         help="don't open a live cv2 preview window (file source only)")
     parser.add_argument("--save-dir", default=None,
                          help="if set, periodically save raw (undetected) frames here for later dataset curation")
     parser.add_argument("--save-interval", type=float, default=2.0,
@@ -140,6 +192,10 @@ def main():
 
     setup_logging(args.log_dir)
 
+    if args.source == "file":
+        if not args.video_path or not Path(args.video_path).exists():
+            raise FileNotFoundError(f"No video file at '{args.video_path}'.")
+
     if not Path(args.model_path).exists():
         raise FileNotFoundError(
             f"No checkpoint at '{args.model_path}'."
@@ -148,12 +204,19 @@ def main():
     device = str(get_device())
     logger.info(f"Using device: {device}")
     model = YOLO(args.model_path)
+
+    if args.export_format:
+        exported_path = model.export(format=args.export_format, half=True)
+        logger.info(f"Exported to {exported_path}")
+        return
+
     logger.info(f"Loaded model, classes: {model.names}, confidence threshold: {args.conf:.0%}")
 
     cap = open_capture(args)
     window = "Box Detector - YOLO Pose (q to quit)"
     last_log_time = 0.0
     last_save_time = 0.0
+    show_preview = not (args.source == "file" and args.no_preview)
 
     save_dir = None
     if args.save_dir:
@@ -161,10 +224,24 @@ def main():
         save_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Saving raw frames to {save_dir} every {args.save_interval}s")
 
+    writer = None
+    output_path = None
+    if args.source == "file":
+        output_path = Path(args.output_path) if args.output_path else Path(args.video_path).with_name(
+            f"{Path(args.video_path).stem}_annotated.mp4")
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        logger.info(f"Writing annotated video to {output_path}")
+
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
+                if args.source == "file":
+                    logger.info("Reached end of video.")
+                    break
                 logger.warning("Lost the video stream, retrying...")
                 cap.release()
                 time.sleep(args.reconnect_delay)
@@ -177,18 +254,29 @@ def main():
                 cv2.imwrite(str(frame_path), frame)
                 last_save_time = now
 
-            result = model.predict(frame, imgsz=args.img_size, conf=args.conf, device=device, verbose=False)[0]
+            result = model.predict(
+                frame, imgsz=args.img_size, conf=args.conf, device=device, verbose=False,
+                quantize=args.quantize, max_det=args.max_det, iou=args.iou,
+                classes=args.classes, agnostic_nms=args.agnostic_nms, save_crop=args.save_crop,
+            )[0]
             draw_detections(frame, result, args.conf)
 
             if now - last_log_time >= args.log_interval:
                 log_detections(result)
                 last_log_time = now
 
-            cv2.imshow(window, frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+            if writer is not None:
+                writer.write(frame)
+
+            if show_preview:
+                cv2.imshow(window, frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
     finally:
         cap.release()
+        if writer is not None:
+            writer.release()
+            logger.info(f"Saved annotated video to {output_path}")
         cv2.destroyAllWindows()
 
 

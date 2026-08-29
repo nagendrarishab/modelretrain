@@ -1,6 +1,6 @@
 """
-    python src/run_camera_efficientnet_detect.py --model-path models/efficientnet_efficientnet_b0_detect_best.pt --source webcam
-    python src/run_camera_efficientnet_detect.py --model-path models/efficientnet_efficientnet_b0_detect_best.pt --source droidcam \
+    python src/run/run_camera_resnet_tf_detect.py --model-path models/resnet_tf_resnet50_detect_best.keras --source webcam
+    python src/run/run_camera_resnet_tf_detect.py --model-path models/resnet_tf_resnet50_detect_best.keras --source droidcam \
         --droidcam-ip 192.168.0.107 --droidcam-port 4747
 """
 import argparse
@@ -15,25 +15,11 @@ import certifi
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 
 import cv2
-import torch
-from torchvision.models import efficientnet_b0, efficientnet_b1, efficientnet_b2, efficientnet_b3, efficientnet_b4
-from torchvision.models.detection import FasterRCNN
-from torchvision.models.detection.backbone_utils import BackboneWithFPN
-from torchvision.transforms.functional import to_tensor
+import keras
+import numpy as np
+import yaml
 
-logger = logging.getLogger("camera_efficientnet_detect")
-
-BACKBONE_CTORS = {
-    "efficientnet_b0": efficientnet_b0,
-    "efficientnet_b1": efficientnet_b1,
-    "efficientnet_b2": efficientnet_b2,
-    "efficientnet_b3": efficientnet_b3,
-    "efficientnet_b4": efficientnet_b4,
-}
-
-# Must match train_efficientnet_detect.py's FPN_TAP_INDICES exactly - this is
-# what makes a saved state_dict's layer names line up with a freshly built model.
-FPN_TAP_INDICES = [2, 3, 4, 6]
+logger = logging.getLogger("camera_resnet_tf_detect")
 
 
 def setup_logging(log_dir):
@@ -55,41 +41,13 @@ def setup_logging(log_dir):
     return log_path
 
 
-def get_device():
-    # No MPS branch: same numerical-instability reasoning as
-    # run_camera_resnet_detect.py - this Faster R-CNN head's ROIAlign/NMS ops
-    # are unreliable on Apple's MPS backend with this torch/torchvision version.
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
-
-
 LABEL_COLORS = {"open": (0, 200, 0), "closed": (0, 0, 220)}  # BGR
 
 
-def _probe_fpn_channels(features):
-    channels = []
-    h = torch.zeros(1, 3, 256, 256)
-    with torch.no_grad():
-        for i, layer in enumerate(features):
-            h = layer(h)
-            if i in FPN_TAP_INDICES:
-                channels.append(h.shape[1])
-    return channels
-
-
-def load_model(model_path, device):
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    class_names = checkpoint["class_names"]
-
-    net = BACKBONE_CTORS[checkpoint["backbone"]](weights=None)
-    return_layers = {str(i): str(j) for j, i in enumerate(FPN_TAP_INDICES)}
-    in_channels_list = _probe_fpn_channels(net.features)
-    backbone = BackboneWithFPN(net.features, return_layers, in_channels_list, out_channels=256)
-
-    model = FasterRCNN(backbone, num_classes=len(class_names) + 1)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(device).eval()
+def load_model(model_path, data_yaml="data_detect/data.yaml"):
+    model = keras.saving.load_model(model_path)
+    names_dict = yaml.safe_load(Path(data_yaml).read_text())["names"]
+    class_names = [names_dict[i] for i in sorted(names_dict)]
     return model, class_names
 
 
@@ -108,17 +66,36 @@ def open_capture(args):
     return cap
 
 
-@torch.no_grad()
-def detect(model, class_names, frame, device, conf_threshold):
-    img_tensor = to_tensor(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).to(device)
-    prediction = model([img_tensor])[0]
+def detect(model, class_names, frame, conf_threshold, height, width):
+    # Predicted box coordinates come back in the model's fixed input
+    # resolution (height, width), not the original frame's - the
+    # preprocessor's image_converter resizes internally at predict() time
+    # but nothing rescales predictions back to the caller's input size. So
+    # every box is rescaled back to the original frame here, keeping this
+    # function's contract (original-frame pixel space) the same as every
+    # other detect() in this repo, and the same as evaluate_models.py expects.
+    orig_height, orig_width = frame.shape[:2]
+    resized = cv2.resize(frame, (width, height))
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    batch = np.expand_dims(rgb, axis=0)
+    prediction = model.predict(batch, verbose=0)
+
+    boxes = np.asarray(prediction["boxes"])[0]
+    classes = np.asarray(prediction["labels"])[0]
+    scores = np.asarray(prediction["confidence"])[0]
+    num_detections = int(np.asarray(prediction["num_detections"])[0])
+    x_scale, y_scale = orig_width / width, orig_height / height
 
     detections = []
-    for box, label, score in zip(prediction["boxes"], prediction["labels"], prediction["scores"]):
-        if score < conf_threshold:
+    for box, cls, score in zip(boxes[:num_detections], classes[:num_detections], scores[:num_detections]):
+        if score < conf_threshold or not np.all(np.isfinite(box)):
             continue
-        x1, y1, x2, y2 = map(int, box.tolist())
-        class_name = class_names[int(label.item()) - 1]  # label 0 is background
+        y1, x1, y2, x2 = box.tolist()  # RetinaNet yxyx, in (height, width) input space
+        x1 = int(np.clip(x1 * x_scale, 0, orig_width))
+        x2 = int(np.clip(x2 * x_scale, 0, orig_width))
+        y1 = int(np.clip(y1 * y_scale, 0, orig_height))
+        y2 = int(np.clip(y2 * y_scale, 0, orig_height))
+        class_name = class_names[int(cls)]  # 0-indexed, no background class
         detections.append((x1, y1, x2, y2, class_name, float(score)))
     return detections
 
@@ -142,7 +119,10 @@ def log_detections(detections):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", default="models/efficientnet_efficientnet_b0_detect_best.pt")
+    parser.add_argument("--model-path", default="models/resnet_tf_resnet50_detect_best.keras")
+    parser.add_argument("--data", default="data_detect/data.yaml", help="source of class names")
+    parser.add_argument("--height", type=int, default=480, help="must match the model's trained input size")
+    parser.add_argument("--width", type=int, default=640, help="must match the model's trained input size")
     parser.add_argument("--conf", type=float, default=0.5,
                          help="minimum confidence to consider the box 'visible' and draw anything")
     parser.add_argument("--source", choices=["webcam", "droidcam"], default="webcam")
@@ -163,13 +143,11 @@ def main():
     if not Path(args.model_path).exists():
         raise FileNotFoundError(f"No checkpoint at '{args.model_path}'.")
 
-    device = get_device()
-    logger.info(f"Using device: {device}")
-    model, class_names = load_model(args.model_path, device)
+    model, class_names = load_model(args.model_path, args.data)
     logger.info(f"Loaded model, classes: {class_names}, confidence threshold: {args.conf:.0%}")
 
     cap = open_capture(args)
-    window = "Box Detector - EfficientNet Faster R-CNN (q to quit)"
+    window = "Box Detector - ResNet RetinaNet TF (q to quit)"
     last_log_time = 0.0
 
     try:
@@ -182,7 +160,7 @@ def main():
                 cap = open_capture(args)
                 continue
 
-            detections = detect(model, class_names, frame, device, args.conf)
+            detections = detect(model, class_names, frame, args.conf, args.height, args.width)
             draw_detections(frame, detections)
 
             now = time.monotonic()

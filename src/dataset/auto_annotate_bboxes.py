@@ -25,6 +25,8 @@ Controls:
   o / c                    (raw/extra/ only) set the class new boxes will get
                            when drawn - shown in the window title bar
   y / n / Enter            save all boxes currently drawn, move to next
+  e                        confirm this image has no box - save an empty label
+                           and move to next (only when no boxes are drawn)
   r                        undo the most recently added box
   s                        skip this image (no label saved, move on)
   b                        go back to the previous image
@@ -226,7 +228,8 @@ def annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, class_id
             x1, y1, x2, y2 = state.current
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 255), 1)
         suggestion_note = f" [{source}: {len(initial_rects)} suggested]" if initial_rects else " [no suggestion]"
-        status = f" - {len(state.boxes)} box(es), drag to add another, r=undo last"
+        status = (f" - no boxes, e=confirm empty" if not state.boxes
+                  else f" - {len(state.boxes)} box(es), drag to add another, r=undo last")
         label = "mixed" if mixed else CLASSES[class_id]
         mode_note = f" [pending class: {CLASSES[pending[0]]} (o/c to change, right-click box to toggle)]" if mixed else ""
         cv2.putText(frame, f"{path.name} [{label}]{suggestion_note}{status}{mode_note}", (10, 24),
@@ -239,6 +242,8 @@ def annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, class_id
                 continue  # need at least one box before advancing
             lines = "".join(rect_to_yolo_line(b, disp_w, disp_h) for b in state.boxes)
             return ("save", lines)
+        if key == ord("e") and not state.boxes:
+            return ("save", "")
         if key == ord("r"):
             if state.boxes:
                 state.boxes.pop()
@@ -322,7 +327,7 @@ def main():
         print("Nothing to do.")
         return
 
-    window = "Auto-annotate (drag=add box, n/y/Enter=save+next, r=undo last box, s=skip, b=back, q=quit)"
+    window = "Auto-annotate (drag=add box, n/y/Enter=save+next, e=confirm empty, r=undo last box, s=skip, b=back, q=quit)"
     cv2.namedWindow(window)
 
     idx = 0

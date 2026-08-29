@@ -1,5 +1,17 @@
 """
-    python src/train_efficientnet_detect.py --backbone efficientnet_b0 --epochs 30
+    python src/train/train_mobilenetv3_detect.py --epochs 30
+
+Faster R-CNN on a MobileNetV3-Large backbone, using torchvision's own
+ready-made `fasterrcnn_mobilenet_v3_large_fpn`/`fasterrcnn_mobilenet_v3_large_320_fpn`
+constructors instead of hand-building a backbone+FPN wrapper (unlike
+train_mobilenetv4_detect.py, which has to - torchvision has no MobileNetV4
+at all). MobileNetV3 is one of the only two backbones (the other being
+ResNet) torchvision ships a ready-made Faster R-CNN constructor for.
+
+Both constructors default to `weights=None` (no COCO-pretrained detection
+head to discard) and `weights_backbone=MobileNet_V3_Large_Weights.IMAGENET1K_V1`
+- matching this repo's ImageNet-only convention already, with zero custom
+code needed to get there.
 """
 import argparse
 import os
@@ -14,36 +26,17 @@ import yaml
 from PIL import Image
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
-from torchvision.models import efficientnet_b0, efficientnet_b1, efficientnet_b2, efficientnet_b3, efficientnet_b4
-from torchvision.models.detection import FasterRCNN
-from torchvision.models.detection.backbone_utils import BackboneWithFPN
+from torchvision.models.detection import fasterrcnn_mobilenet_v3_large_fpn, fasterrcnn_mobilenet_v3_large_320_fpn
 from torchvision.transforms.functional import to_tensor
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 from tqdm import tqdm
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
-BACKBONE_CTORS = {
-    "efficientnet_b0": efficientnet_b0,
-    "efficientnet_b1": efficientnet_b1,
-    "efficientnet_b2": efficientnet_b2,
-    "efficientnet_b3": efficientnet_b3,
-    "efficientnet_b4": efficientnet_b4,
-}
-
-BACKBONE_WEIGHTS = {
-    "efficientnet_b0": "IMAGENET1K_V1",
-    "efficientnet_b1": "IMAGENET1K_V2",
-    "efficientnet_b2": "IMAGENET1K_V1",
-    "efficientnet_b3": "IMAGENET1K_V1",
-    "efficientnet_b4": "IMAGENET1K_V1",
-}
-
-FPN_TAP_INDICES = [2, 3, 4, 6]
+VARIANT_CHOICES = ["large_fpn", "large_320_fpn"]
 
 
 def get_device():
-
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
@@ -95,7 +88,6 @@ def collate_fn(batch):
 
 
 def warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor):
-
     def f(step):
         if step >= warmup_iters:
             return 1.0
@@ -105,24 +97,9 @@ def warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, f)
 
 
-def _probe_fpn_channels(features):
-
-    channels = []
-    h = torch.zeros(1, 3, 256, 256)
-    with torch.no_grad():
-        for i, layer in enumerate(features):
-            h = layer(h)
-            if i in FPN_TAP_INDICES:
-                channels.append(h.shape[1])
-    return channels
-
-
-def build_model(backbone_name, num_classes):
-    net = BACKBONE_CTORS[backbone_name](weights=BACKBONE_WEIGHTS[backbone_name])
-    return_layers = {str(i): str(j) for j, i in enumerate(FPN_TAP_INDICES)}
-    in_channels_list = _probe_fpn_channels(net.features)
-    backbone = BackboneWithFPN(net.features, return_layers, in_channels_list, out_channels=256)
-    return FasterRCNN(backbone, num_classes=num_classes)
+def build_model(num_classes, variant):
+    ctor = fasterrcnn_mobilenet_v3_large_320_fpn if variant == "large_320_fpn" else fasterrcnn_mobilenet_v3_large_fpn
+    return ctor(weights=None, num_classes=num_classes)
 
 
 @torch.no_grad()
@@ -141,21 +118,17 @@ def evaluate(model, data_loader, device):
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data", default="data_detect/data.yaml")
-    parser.add_argument("--backbone", default="efficientnet_b0",
-                         choices=["efficientnet_b0", "efficientnet_b1", "efficientnet_b2",
-                                  "efficientnet_b3", "efficientnet_b4"])
+    parser.add_argument("--variant", default="large_fpn", choices=VARIANT_CHOICES,
+                         help="large_fpn (higher accuracy, default input resolution) or large_320_fpn "
+                              "(lower internal resolution, faster) - both ImageNet-backbone by default")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=0.005)
     parser.add_argument("--workers", type=int, default=4, help="DataLoader worker processes")
-    parser.add_argument("--output", default=None,
-                         help="Output path. Defaults to models/efficientnet_<backbone>_detect_best.pt")
+    parser.add_argument("--output", default="models/mobilenetv3_detect_best.pt")
     args = parser.parse_args()
-
-    if args.output is None:
-        args.output = f"models/efficientnet_{args.backbone}_detect_best.pt"
 
     data_yaml_path = Path(args.data)
     if not data_yaml_path.exists():
@@ -193,7 +166,7 @@ def main():
     print(f"Train: {len(train_loader.dataset)} images ({len(train_loader)} batches/epoch)  "
           f"Val: {len(val_loader.dataset)}  Test: {len(test_loader.dataset)}")
 
-    model = build_model(args.backbone, num_classes).to(device)
+    model = build_model(num_classes, args.variant).to(device)
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=0.0005)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(args.epochs // 3, 1), gamma=0.1)
@@ -248,13 +221,14 @@ def main():
         if map50 > best_map50:
             best_map50 = map50
             torch.save({"model_state_dict": model.state_dict(),
-                        "backbone": args.backbone,
+                        "family": "mobilenetv3-fasterrcnn",
+                        "variant": args.variant,
                         "class_names": class_names}, args.output)
 
     print(f"\nSaved best model to {args.output} (val mAP50={best_map50:.4f})")
 
     best = torch.load(args.output, map_location=device, weights_only=False)
-    model = build_model(best["backbone"], len(best["class_names"]) + 1).to(device)
+    model = build_model(len(best["class_names"]) + 1, best["variant"]).to(device)
     model.load_state_dict(best["model_state_dict"])
     test_map50, test_map5095 = evaluate(model, test_loader, device)
     print(f"Test mAP50: {test_map50:.4f}  mAP50-95: {test_map5095:.4f}")

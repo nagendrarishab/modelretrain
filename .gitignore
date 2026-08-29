@@ -19,3 +19,5 @@ raw/
 raw_labels/
 /data_detect
 *.ipynb
+data_pose/
+testcase/

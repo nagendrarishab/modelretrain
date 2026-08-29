@@ -1,7 +1,20 @@
 """
-    python src/run_camera_nanodet_detect.py --model-path models/nanodet_best.pt --source webcam
-    python src/run_camera_nanodet_detect.py --model-path models/nanodet_best.pt \
+    python src/run/run_camera_nanodet_tf_detect.py --model-path models/nanodet_tf_best.keras --source webcam
+    python src/run/run_camera_nanodet_tf_detect.py --model-path models/nanodet_tf_best.keras \
         --camera-index 1 --save-dir raw_capture --save-interval 2
+
+TensorFlow/Keras counterpart to run_camera_nanodet_detect.py - loads the
+plain keras.Model saved by train_nanodet_tf_detect.py (6 raw per-level
+outputs: 3 cls_scores + 3 bbox_preds, NHWC) and decodes it the same
+anchor-free FCOS-style way. NMS/box-decoding runs entirely in plain numpy
+here, outside any traced graph - same "not part of forward()" design as the
+PyTorch version, and the reason this family's TFLite export needs no Flex
+delegate (see src/convert_tflite.py).
+
+STRIDES/EVAL constants are duplicated verbatim from train_nanodet_tf_detect.py
+(same convention the original PyTorch camera script uses) - a change to the
+trainer's architecture constants needs the identical change copied here, or
+a loaded checkpoint's outputs won't decode correctly.
 """
 import argparse
 import logging
@@ -15,26 +28,85 @@ import certifi
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 
 import cv2
+import keras
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torchvision.models import ShuffleNet_V2_X1_0_Weights, shufflenet_v2_x1_0
-from torchvision.ops import batched_nms
+import tensorflow as tf
+import yaml
 
-logger = logging.getLogger("camera_nanodet_detect")
+logger = logging.getLogger("camera_nanodet_tf_detect")
 
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-# Must match train_nanodet_detect.py's copies of these exactly
+# Must match train_nanodet_tf_detect.py's copies of these exactly
 STRIDES = (8, 16, 32)
-FEAT_CHANNELS = 96
-STACKED_CONVS = 2
-BACKBONE_CHANNELS = (116, 232, 464)
-
 NMS_IOU_THRESH = 0.6
 MAX_DETECTIONS = 100
+
+LABEL_COLORS = {"open": (0, 200, 0), "closed": (0, 0, 220)}  # BGR
+
+
+# Custom layer classes below must stay in sync with train_nanodet_tf_detect.py's
+# copies exactly (same reason the PyTorch camera script duplicates the whole
+# NanoDet/NanoDetNeck/NanoDetHead class hierarchy) - keras.saving.load_model()
+# needs these classes registered in this process to deserialize the checkpoint,
+# even though (unlike the PyTorch state_dict case) the architecture itself is
+# fully described inside the .keras file and doesn't need to be rebuilt by hand.
+
+@keras.saving.register_keras_serializable(package="nanodet_tf")
+class ChannelShuffle(keras.layers.Layer):
+    def __init__(self, groups=2, **kwargs):
+        super().__init__(**kwargs)
+        self.groups = groups
+
+    def call(self, x):
+        shape = keras.ops.shape(x)
+        n, h, w, c = shape[0], shape[1], shape[2], shape[3]
+        cpg = c // self.groups
+        x = keras.ops.reshape(x, (n, h, w, self.groups, cpg))
+        x = keras.ops.transpose(x, (0, 1, 2, 4, 3))
+        return keras.ops.reshape(x, (n, h, w, c))
+
+    def get_config(self):
+        config = super().get_config()
+        config["groups"] = self.groups
+        return config
+
+
+@keras.saving.register_keras_serializable(package="nanodet_tf")
+class Scale(keras.layers.Layer):
+    def build(self, input_shape):
+        self.scale = self.add_weight(name="scale", shape=(), initializer="ones", trainable=True)
+
+    def call(self, x):
+        return x * self.scale
+
+
+@keras.saving.register_keras_serializable(package="nanodet_tf")
+class DepthwiseSeparableConv(keras.layers.Layer):
+    def __init__(self, channels, **kwargs):
+        super().__init__(**kwargs)
+        self.channels = channels
+        self.pad = keras.layers.ZeroPadding2D(1)
+        self.dw = keras.layers.DepthwiseConv2D(3, padding="valid", use_bias=False)
+        self.pw = keras.layers.Conv2D(channels, 1, use_bias=False)
+        self.bn = keras.layers.BatchNormalization(epsilon=1e-5)
+        self.act = keras.layers.Activation("relu")
+
+    def build(self, input_shape):
+        super().build(input_shape)
+
+    def call(self, x):
+        x = self.pad(x)
+        x = self.dw(x)
+        x = self.pw(x)
+        x = self.bn(x)
+        return self.act(x)
+
+    def get_config(self):
+        config = super().get_config()
+        config["channels"] = self.channels
+        return config
 
 
 def setup_logging(log_dir):
@@ -56,147 +128,51 @@ def setup_logging(log_dir):
     return log_path
 
 
-def get_device():
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-LABEL_COLORS = {"open": (0, 200, 0), "closed": (0, 0, 220)}  # BGR
-
-
-class DepthwiseSeparableConv(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.depthwise = nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False)
-        self.pointwise = nn.Conv2d(channels, channels, 1, bias=False)
-        self.bn = nn.BatchNorm2d(channels)
-        self.act = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        x = self.depthwise(x)
-        x = self.pointwise(x)
-        x = self.bn(x)
-        return self.act(x)
-
-
-class Scale(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.scale = nn.Parameter(torch.tensor(1.0))
-
-    def forward(self, x):
-        return x * self.scale
-
-
-class NanoDetNeck(nn.Module):
-    def __init__(self, in_channels_list, out_channels):
-        super().__init__()
-        self.laterals = nn.ModuleList(nn.Conv2d(c, out_channels, 1) for c in in_channels_list)
-
-    def forward(self, feats):
-        laterals = [lateral(f) for lateral, f in zip(self.laterals, feats)]
-        for i in range(len(laterals) - 1, 0, -1):
-            laterals[i - 1] = laterals[i - 1] + F.interpolate(
-                laterals[i], size=laterals[i - 1].shape[-2:], mode="nearest"
-            )
-        return laterals
-
-
-class NanoDetHead(nn.Module):
-    def __init__(self, num_classes, feat_channels, stacked_convs, strides):
-        super().__init__()
-        self.cls_convs = nn.ModuleList(DepthwiseSeparableConv(feat_channels) for _ in range(stacked_convs))
-        self.reg_convs = nn.ModuleList(DepthwiseSeparableConv(feat_channels) for _ in range(stacked_convs))
-        self.cls_pred = nn.Conv2d(feat_channels, num_classes, 3, padding=1)
-        self.reg_pred = nn.Conv2d(feat_channels, 4, 3, padding=1)
-        self.scales = nn.ModuleList(Scale() for _ in strides)
-
-    def forward(self, feats):
-        cls_scores, bbox_preds = [], []
-        for feat, scale in zip(feats, self.scales):
-            cls_feat = feat
-            for conv in self.cls_convs:
-                cls_feat = conv(cls_feat)
-            reg_feat = feat
-            for conv in self.reg_convs:
-                reg_feat = conv(reg_feat)
-            cls_scores.append(self.cls_pred(cls_feat))
-            bbox_preds.append(scale(self.reg_pred(reg_feat)))
-        return cls_scores, bbox_preds
-
-
-class NanoDet(nn.Module):
-    def __init__(self, num_classes, feat_channels=FEAT_CHANNELS, stacked_convs=STACKED_CONVS, strides=STRIDES):
-        super().__init__()
-        backbone = shufflenet_v2_x1_0(weights=None)
-        self.stem = nn.Sequential(backbone.conv1, backbone.maxpool)
-        self.stage2 = backbone.stage2
-        self.stage3 = backbone.stage3
-        self.stage4 = backbone.stage4
-        self.neck = NanoDetNeck(BACKBONE_CHANNELS, feat_channels)
-        self.head = NanoDetHead(num_classes, feat_channels, stacked_convs, strides)
-
-    def forward(self, x):
-        x = self.stem(x)
-        c3 = self.stage2(x)
-        c4 = self.stage3(c3)
-        c5 = self.stage4(c4)
-        feats = self.neck([c3, c4, c5])
-        return self.head(feats)
-
-
-def generate_points(feat_size, stride, device):
+def generate_points(feat_size, stride):
     h, w = feat_size
-    ys = (torch.arange(h, device=device, dtype=torch.float32) + 0.5) * stride
-    xs = (torch.arange(w, device=device, dtype=torch.float32) + 0.5) * stride
-    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-    return torch.stack([grid_x.reshape(-1), grid_y.reshape(-1)], dim=-1)  
+    ys = (np.arange(h, dtype=np.float32) + 0.5) * stride
+    xs = (np.arange(w, dtype=np.float32) + 0.5) * stride
+    grid_y, grid_x = np.meshgrid(ys, xs, indexing="ij")
+    return np.stack([grid_x.reshape(-1), grid_y.reshape(-1)], axis=-1)
 
 
-def decode_single(cls_scores, bbox_preds, strides, img_size, score_thresh, nms_iou=NMS_IOU_THRESH, max_dets=MAX_DETECTIONS):
-    device = cls_scores[0].device
+def decode_single(cls_scores, bbox_preds, strides, img_size, score_thresh,
+                   nms_iou=NMS_IOU_THRESH, max_dets=MAX_DETECTIONS):
     all_boxes, all_scores, all_labels = [], [], []
     for cls_score, bbox_pred, stride in zip(cls_scores, bbox_preds, strides):
-        h, w = cls_score.shape[-2:]
-        points = generate_points((h, w), stride, device)
-        scores = cls_score.permute(1, 2, 0).reshape(-1, cls_score.shape[0]).sigmoid()
-        dist = bbox_pred.permute(1, 2, 0).reshape(-1, 4).exp() * stride
+        h, w = cls_score.shape[0], cls_score.shape[1]
+        points = generate_points((h, w), stride)
+        scores = 1.0 / (1.0 + np.exp(-cls_score.reshape(-1, cls_score.shape[-1])))
+        dist = np.exp(bbox_pred.reshape(-1, 4)) * stride
 
-        max_scores, labels = scores.max(dim=1)
+        labels = scores.argmax(axis=1)
+        max_scores = scores[np.arange(scores.shape[0]), labels]
         keep = max_scores > score_thresh
         if not keep.any():
             continue
 
         pts, dist, max_scores, labels = points[keep], dist[keep], max_scores[keep], labels[keep]
-        boxes = torch.stack([
+        boxes = np.stack([
             pts[:, 0] - dist[:, 0], pts[:, 1] - dist[:, 1],
             pts[:, 0] + dist[:, 2], pts[:, 1] + dist[:, 3],
-        ], dim=-1).clamp(0, img_size)
+        ], axis=-1).clip(0, img_size)
 
         all_boxes.append(boxes)
         all_scores.append(max_scores)
         all_labels.append(labels)
 
     if not all_boxes:
-        return (torch.zeros((0, 4), device=device), torch.zeros(0, device=device),
-                torch.zeros(0, dtype=torch.int64, device=device))
+        return np.zeros((0, 4), dtype=np.float32), np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.int64)
 
-    boxes, scores, labels = torch.cat(all_boxes), torch.cat(all_scores), torch.cat(all_labels)
-    keep = batched_nms(boxes, scores, labels, nms_iou)[:max_dets]
+    boxes, scores, labels = np.concatenate(all_boxes), np.concatenate(all_scores), np.concatenate(all_labels)
+    keep = tf.image.non_max_suppression(boxes, scores, max_dets, iou_threshold=nms_iou).numpy()
     return boxes[keep], scores[keep], labels[keep]
 
 
-def load_model(model_path, device):
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    class_names = checkpoint["class_names"]
-    img_size = checkpoint["img_size"]
-
-    model = NanoDet(len(class_names))
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(device).eval()
+def load_model(model_path, data_yaml="data_detect/data.yaml", img_size=320):
+    model = keras.saving.load_model(model_path)
+    names_dict = yaml.safe_load(Path(data_yaml).read_text())["names"]
+    class_names = [names_dict[i] for i in sorted(names_dict)]
     return model, class_names, img_size
 
 
@@ -220,16 +196,16 @@ def open_capture(args):
     return cap
 
 
-@torch.no_grad()
-def detect(model, class_names, img_size, frame, device, conf_threshold):
+def detect(model, class_names, img_size, frame, conf_threshold):
     height, width = frame.shape[:2]
     resized = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), (img_size, img_size), interpolation=cv2.INTER_LINEAR)
     normalized = (resized.astype(np.float32) / 255.0 - IMAGENET_MEAN) / IMAGENET_STD
-    img_tensor = torch.from_numpy(normalized.transpose(2, 0, 1)).float().unsqueeze(0).to(device)
+    batch = np.expand_dims(normalized, axis=0)
 
-    cls_scores, bbox_preds = model(img_tensor)
+    outputs = model.predict(batch, verbose=0)
+    cls_scores, bbox_preds = outputs[:3], outputs[3:]
     boxes, scores, labels = decode_single(
-        [cs[0] for cs in cls_scores], [bp[0] for bp in bbox_preds], STRIDES, img_size, conf_threshold,
+        [c[0] for c in cls_scores], [b[0] for b in bbox_preds], STRIDES, img_size, conf_threshold,
     )
 
     scale_x, scale_y = width / img_size, height / img_size
@@ -261,8 +237,10 @@ def log_detections(detections):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", default="models/nanodet_best.pt")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--model-path", default="models/nanodet_tf_best.keras")
+    parser.add_argument("--data", default="data_detect/data.yaml", help="source of class names")
+    parser.add_argument("--img-size", type=int, default=320, help="must match the model's trained input size")
     parser.add_argument("--conf", type=float, default=0.5,
                          help="minimum confidence to consider the box 'visible' and draw anything")
     parser.add_argument("--source", choices=["webcam", "droidcam"], default="webcam")
@@ -292,13 +270,11 @@ def main():
     if args.save_dir:
         Path(args.save_dir).mkdir(parents=True, exist_ok=True)
 
-    device = get_device()
-    logger.info(f"Using device: {device}")
-    model, class_names, img_size = load_model(args.model_path, device)
+    model, class_names, img_size = load_model(args.model_path, args.data, args.img_size)
     logger.info(f"Loaded model, classes: {class_names}, img_size: {img_size}, confidence threshold: {args.conf:.0%}")
 
     cap = open_capture(args)
-    window = "Box Detector - NanoDet (q to quit)"
+    window = "Box Detector - NanoDet TF (q to quit)"
     last_log_time = 0.0
     last_save_time = 0.0
 
@@ -319,7 +295,7 @@ def main():
                     cv2.imwrite(str(save_path), frame)
                     last_save_time = now
 
-            detections = detect(model, class_names, img_size, frame, device, args.conf)
+            detections = detect(model, class_names, img_size, frame, args.conf)
             draw_detections(frame, detections)
 
             now = time.monotonic()

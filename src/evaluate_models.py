@@ -1,14 +1,15 @@
 """
     python src/evaluate_models.py --model-path models/yolo26n_best.pt
-    python src/evaluate_models.py --model-path models/yolo26n_best.pt models/resnet_resnet50_detect_best.pt \
+    python src/evaluate_models.py --model-path models/yolo26n_best.pt models/resnet_tf_resnet50_detect_best.keras \
         models/nanodet_best.pt --conf 0.5 --iou 0.5
 
 Deliberately NOT self-contained like this repo's trainers/camera scripts: it
-imports load_model()/detect()/get_device() from the four run_camera_*_detect.py
+imports load_model()/detect()/get_device() from the run_camera_*_detect.py
 files instead of re-deriving each architecture's FPN/backbone wiring by hand
 """
 import argparse
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -16,20 +17,24 @@ import certifi
 
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "run"))
+
 import cv2
 import numpy as np
 import torch
 import yaml
 from torchvision.ops import box_iou
 
-from run_camera_resnet_detect import get_device as get_device_resnet, load_model as load_resnet, \
-    detect as detect_resnet
-from run_camera_efficientnet_detect import get_device as get_device_efficientnet, load_model as load_efficientnet, \
-    detect as detect_efficientnet
+from run_camera_resnet_tf_detect import load_model as load_resnet_tf, detect as detect_resnet_tf
+import run_camera_mobilenet_tf_detect  # noqa: F401 - side effect only: registers PyramidMobileNetBackbone
+                                        # so keras.saving.load_model() can deserialize a MobileNet-TF checkpoint
 from run_camera_mobilenetv4_detect import get_device as get_device_mobilenetv4, load_model as load_mobilenetv4, \
     detect as detect_mobilenetv4
-from run_camera_nanodet_detect import get_device as get_device_nanodet, load_model as load_nanodet, \
-    detect as detect_nanodet
+from run_camera_nanodet_tf_detect import load_model as load_nanodet_tf, detect as detect_nanodet_tf
+from run_camera_resnet_fasterrcnn_detect import get_device as get_device_resnet_fasterrcnn, \
+    load_model as load_resnet_fasterrcnn, detect as detect_resnet_fasterrcnn
+from run_camera_mobilenetv3_detect import get_device as get_device_mobilenetv3, load_model as load_mobilenetv3, \
+    detect as detect_mobilenetv3
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
@@ -56,14 +61,9 @@ def get_device_yolo():
 
 
 def backbone_family(backbone_name):
-    if backbone_name.startswith("resnet"):
-        return "resnet"
-    if backbone_name.startswith("efficientnet"):
-        return "efficientnet"
     if backbone_name.startswith("mobilenetv4"):
         return "mobilenetv4"
-    raise ValueError(f"Unrecognized backbone '{backbone_name}' in checkpoint - "
-                      f"expected a resnet*/efficientnet_b*/mobilenetv4_* name")
+    raise ValueError(f"Unrecognized backbone '{backbone_name}' in checkpoint - expected a mobilenetv4_* name")
 
 
 def load_yolo(path_str, conf):
@@ -89,7 +89,7 @@ def load_yolo(path_str, conf):
     return f"yolo-{task}", class_names, predictor
 
 
-def identify_and_load(model_path, conf):
+def identify_and_load(model_path, conf, data_yaml):
     """Returns (family_label, model_class_names, predictor) where predictor(frame)
     -> list of (x1, y1, x2, y2, class_name, score) in original-frame pixel space,
     already filtered to score >= conf."""
@@ -97,42 +97,69 @@ def identify_and_load(model_path, conf):
     if Path(path_str).name.lower().startswith("yolo"):
         return load_yolo(path_str, conf)
 
+    if path_str.endswith(".keras"):
+        # load_model()/detect() are backbone-agnostic (KerasHub serializes the
+        # whole RetinaNetObjectDetector, backbone included) - identical code
+        # works for any TF/KerasHub RetinaNet checkpoint. NanoDet-TF is a
+        # plain keras.Model instead (no .backbone/.preprocessor attrs, raw
+        # per-level cls_scores/bbox_preds output) - detected by their absence.
+        model, class_names = load_resnet_tf(path_str, data_yaml)
+        if hasattr(model, "backbone") and hasattr(model, "preprocessor"):
+            encoder_name = type(model.backbone.image_encoder).__name__
+            if "ResNet" in encoder_name:
+                family = "resnet-tf"
+            elif "EfficientNet" in encoder_name:
+                family = "efficientnet-tf"
+            elif "DenseNet" in encoder_name:
+                family = "densenet-tf"
+            elif "MobileNet" in encoder_name:
+                family = "mobilenet-tf"
+            else:
+                family = f"kerashub-{encoder_name.lower()}"
+            predictor = lambda frame: detect_resnet_tf(model, class_names, frame, conf, 480, 640)
+            return family, class_names, predictor
+        else:
+            img_size = model.input_shape[1]
+            predictor = lambda frame: detect_nanodet_tf(model, class_names, img_size, frame, conf)
+            return "nanodet-tf", class_names, predictor
+
     ckpt = None
     try:
         ckpt = torch.load(path_str, map_location="cpu", weights_only=False)
     except Exception:
         ckpt = None
 
-    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        if "backbone" in ckpt:
-            family = backbone_family(ckpt["backbone"])
-            if family == "resnet":
-                device = get_device_resnet()
-                model, class_names = load_resnet(path_str, device)
-                predictor = lambda frame: detect_resnet(model, class_names, frame, device, conf)
-            elif family == "efficientnet":
-                device = get_device_efficientnet()
-                model, class_names = load_efficientnet(path_str, device)
-                predictor = lambda frame: detect_efficientnet(model, class_names, frame, device, conf)
-            else:  # mobilenetv4
-                device = get_device_mobilenetv4()
-                model, class_names = load_mobilenetv4(path_str, device)
-                predictor = lambda frame: detect_mobilenetv4(model, class_names, frame, device, conf)
-            return family, class_names, predictor
+    if isinstance(ckpt, dict) and "family" in ckpt:
+        # Ready-made torchvision Faster R-CNN constructors (ResNet, MobileNetV3) -
+        # the checkpoint names its own family explicitly rather than needing
+        # inference from a backbone-name string.
+        if ckpt["family"] == "resnet-fasterrcnn":
+            device = get_device_resnet_fasterrcnn()
+            model, class_names = load_resnet_fasterrcnn(path_str, device)
+            predictor = lambda frame: detect_resnet_fasterrcnn(model, class_names, frame, device, conf)
+            return "resnet-fasterrcnn", class_names, predictor
+        if ckpt["family"] == "mobilenetv3-fasterrcnn":
+            device = get_device_mobilenetv3()
+            model, class_names = load_mobilenetv3(path_str, device)
+            predictor = lambda frame: detect_mobilenetv3(model, class_names, frame, device, conf)
+            return "mobilenetv3-fasterrcnn", class_names, predictor
 
-        device = get_device_nanodet()
-        model, class_names, img_size = load_nanodet(path_str, device)
-        predictor = lambda frame: detect_nanodet(model, class_names, img_size, frame, device, conf)
-        return "nanodet", class_names, predictor
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt and "backbone" in ckpt:
+        family = backbone_family(ckpt["backbone"])
+        device = get_device_mobilenetv4()
+        model, class_names = load_mobilenetv4(path_str, device)
+        predictor = lambda frame: detect_mobilenetv4(model, class_names, frame, device, conf)
+        return family, class_names, predictor
 
-    # Not YOLO-named, and not one of the four custom checkpoint dict shapes either.
+    # Not YOLO-named, and not one of the remaining custom checkpoint dict shapes either.
     got = (f"a dict with keys {sorted(ckpt.keys())}" if isinstance(ckpt, dict)
            else "nothing (torch.load failed)" if ckpt is None
            else type(ckpt).__name__)
     raise ValueError(
         f"'{path_str}' doesn't match any recognized checkpoint shape - expected a "
-        f"filename starting with 'yolo' (Ultralytics), or a ResNet/EfficientNet/"
-        f"MobileNetV4/NanoDet dict (a 'model_state_dict' key). Got: {got}."
+        f"filename starting with 'yolo' (Ultralytics), a '.keras' file (ResNet/"
+        f"EfficientNet RetinaNet or NanoDet, all TF), or a MobileNetV4/ResNet/"
+        f"MobileNetV3 Faster R-CNN dict (a 'model_state_dict' key). Got: {got}."
     )
 
 
@@ -197,7 +224,7 @@ def match_image(preds, gts, name_to_idx, iou_thres, matrix):
         if pi not in matched_pred:
             matrix[name_to_idx[pred[4]], nc] += 1
 
-
+# Calculations
 def summarize(matrix, class_names):
     nc = len(class_names)
     diag = matrix.diagonal()[:nc]
@@ -206,9 +233,9 @@ def summarize(matrix, class_names):
     fn = matrix[:, :nc].sum(axis=0) - diag
     rows = []
     for i, name in enumerate(class_names):
-        p = tp[i] / (tp[i] + fp[i]) if (tp[i] + fp[i]) > 0 else 0.0
-        r = tp[i] / (tp[i] + fn[i]) if (tp[i] + fn[i]) > 0 else 0.0
-        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+        p = tp[i] / (tp[i] + fp[i]) if (tp[i] + fp[i]) > 0 else 0.0 #precision
+        r = tp[i] / (tp[i] + fn[i]) if (tp[i] + fn[i]) > 0 else 0.0 #recall 
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0 #F1 score
         rows.append((name, int(tp[i]), int(fp[i]), int(fn[i]), p, r, f1))
     return rows
 
@@ -216,9 +243,10 @@ def summarize(matrix, class_names):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", nargs="+", required=True,
-                         help="one or more checkpoints - YOLO, YOLO-pose, ResNet/EfficientNet/"
-                              "MobileNetV4 Faster R-CNN, or NanoDet; auto-detected per file")
-    parser.add_argument("--data", default="data_detect/data.yaml")
+                         help="one or more checkpoints - YOLO, YOLO-pose, ResNet/EfficientNet "
+                              "RetinaNet (TF), NanoDet (TF), or MobileNetV4/ResNet/MobileNetV3 "
+                              "Faster R-CNN (PyTorch); auto-detected per file")
+    parser.add_argument("--data", default="testcase/data.yaml")
     parser.add_argument("--split", choices=["train", "val", "test"], default="test")
     parser.add_argument("--conf", type=float, default=0.5,
                          help="confidence threshold - also the confusion-matrix matching "
@@ -255,7 +283,7 @@ def main():
             continue
 
         emit(f"\n{'=' * 70}\nModel: {model_path}")
-        family, model_class_names, predictor = identify_and_load(model_path, args.conf)
+        family, model_class_names, predictor = identify_and_load(model_path, args.conf, args.data)
         emit(f"Detected family: {family}  classes: {model_class_names}")
 
         matrix = np.zeros((nc + 1, nc + 1), dtype=np.int64)
