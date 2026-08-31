@@ -234,6 +234,11 @@ def main():
     print(f"Using device: {device}")
 
     model = YOLO(args.resume or args.model)
+    if device == "mps":
+        # MPS's caching allocator doesn't release memory between epochs the way
+        # CUDA's does, so long runs slowly accumulate until the OS OOM-kills the
+        # process - clear it after each epoch's validation to keep usage flat.
+        model.add_callback("on_fit_epoch_end", lambda trainer: torch.mps.empty_cache())
     train_kwargs = dict(
         data=str(Path(args.data).resolve()),
         epochs=args.epochs,
