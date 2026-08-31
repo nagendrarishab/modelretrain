@@ -2,19 +2,6 @@
     python src/run/run_camera_nanodet_tf_detect.py --model-path models/nanodet_tf_best.keras --source webcam
     python src/run/run_camera_nanodet_tf_detect.py --model-path models/nanodet_tf_best.keras \
         --camera-index 1 --save-dir raw_capture --save-interval 2
-
-TensorFlow/Keras counterpart to run_camera_nanodet_detect.py - loads the
-plain keras.Model saved by train_nanodet_tf_detect.py (6 raw per-level
-outputs: 3 cls_scores + 3 bbox_preds, NHWC) and decodes it the same
-anchor-free FCOS-style way. NMS/box-decoding runs entirely in plain numpy
-here, outside any traced graph - same "not part of forward()" design as the
-PyTorch version, and the reason this family's TFLite export needs no Flex
-delegate (see src/convert_tflite.py).
-
-STRIDES/EVAL constants are duplicated verbatim from train_nanodet_tf_detect.py
-(same convention the original PyTorch camera script uses) - a change to the
-trainer's architecture constants needs the identical change copied here, or
-a loaded checkpoint's outputs won't decode correctly.
 """
 import argparse
 import logging
@@ -40,18 +27,12 @@ IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 # Must match train_nanodet_tf_detect.py's copies of these exactly
 STRIDES = (8, 16, 32)
+REG_MAX = 7  # DFL: distance regressed as a distribution over 0..REG_MAX bins
 NMS_IOU_THRESH = 0.6
 MAX_DETECTIONS = 100
 
 LABEL_COLORS = {"open": (0, 200, 0), "closed": (0, 0, 220)}  # BGR
 
-
-# Custom layer classes below must stay in sync with train_nanodet_tf_detect.py's
-# copies exactly (same reason the PyTorch camera script duplicates the whole
-# NanoDet/NanoDetNeck/NanoDetHead class hierarchy) - keras.saving.load_model()
-# needs these classes registered in this process to deserialize the checkpoint,
-# even though (unlike the PyTorch state_dict case) the architecture itself is
-# fully described inside the .keras file and doesn't need to be rebuilt by hand.
 
 @keras.saving.register_keras_serializable(package="nanodet_tf")
 class ChannelShuffle(keras.layers.Layer):
@@ -136,14 +117,26 @@ def generate_points(feat_size, stride):
     return np.stack([grid_x.reshape(-1), grid_y.reshape(-1)], axis=-1)
 
 
-def decode_single(cls_scores, bbox_preds, strides, img_size, score_thresh,
+def integral_distribution_np(dist_logits, reg_max):
+    """Softmax-weighted integral over the reg_max+1 discrete distance bins
+    (Distribution Focal Loss decode) - must match
+    train_nanodet_tf_detect.py's copy of this function exactly."""
+    dist_logits = dist_logits.reshape(-1, 4, reg_max + 1)
+    exps = np.exp(dist_logits - dist_logits.max(axis=-1, keepdims=True))
+    probs = exps / exps.sum(axis=-1, keepdims=True)
+    bins = np.arange(reg_max + 1, dtype=np.float32)
+    return (probs * bins).sum(axis=-1)  # [-1, 4], distance in stride units
+
+
+def decode_single(cls_scores, bbox_preds, strides, img_size, score_thresh, reg_max=REG_MAX,
                    nms_iou=NMS_IOU_THRESH, max_dets=MAX_DETECTIONS):
     all_boxes, all_scores, all_labels = [], [], []
     for cls_score, bbox_pred, stride in zip(cls_scores, bbox_preds, strides):
         h, w = cls_score.shape[0], cls_score.shape[1]
         points = generate_points((h, w), stride)
         scores = 1.0 / (1.0 + np.exp(-cls_score.reshape(-1, cls_score.shape[-1])))
-        dist = np.exp(bbox_pred.reshape(-1, 4)) * stride
+        dist_units = integral_distribution_np(bbox_pred.reshape(-1, 4 * (reg_max + 1)), reg_max)
+        dist = dist_units * stride
 
         labels = scores.argmax(axis=1)
         max_scores = scores[np.arange(scores.shape[0]), labels]

@@ -3,6 +3,7 @@
 
 """
 import argparse
+from datetime import datetime
 from pathlib import Path
 
 import keras
@@ -12,17 +13,33 @@ import torch
 import yaml
 from keras import layers
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
+from tqdm import tqdm
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
+
+def make_emitter(log_dir):
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    log_path = Path(log_dir) / f"train_nanodet_tf_{datetime.now():%Y%m%d_%H%M%S}.log"
+    log_file = open(log_path, "w")
+
+    def emit(msg):
+        print(msg)
+        log_file.write(msg + "\n")
+        log_file.flush()
+
+    return emit, log_path
+
 STRIDES = (8, 16, 32)
 FEAT_CHANNELS = 96
 STACKED_CONVS = 2
-BACKBONE_CHANNELS = (116, 232, 464)
-REGRESS_RANGES = ((0, 64), (64, 128), (128, float("inf")))
+REG_MAX = 7  # DFL: distance regressed as a distribution over 0..REG_MAX bins, matches NanoDet-Plus's reg_max
 REG_LOSS_WEIGHT = 2.0
+DFL_LOSS_WEIGHT = 0.25
+EMA_DECAY = 0.9998
+SIMOTA_CANDIDATE_TOPK = 10  # per-GT dynamic-k is derived from the sum of this many top IoUs
 
 EVAL_SCORE_THRESH = 0.05
 NMS_IOU_THRESH = 0.6
@@ -153,16 +170,28 @@ def convert_shufflenet_weights(keras_model):
             keras_model.get_layer(f"{name}_b2_pw2_bn").set_weights(bn_w(f"{tkey}.branch2.6"))
 
 
+def pan_downsample(x, out_channels, name):
+    """Stride-2 depthwise-separable downsample used by the neck's bottom-up
+    (PAN) pass - same conv_bn building block the backbone/head already use,
+    just spatially halving instead of preserving resolution."""
+    x = conv_bn(x, out_channels, 3, 2, f"{name}_dw", groups=out_channels)
+    return conv_bn(x, out_channels, 1, 1, f"{name}_pw")
+
+
 def build_neck(feats, out_channels):
-    """1x1 lateral convs to a common channel count + top-down
-    nearest-upsample-and-add - same simplified (no bottom-up second pass)
-    neck as the PyTorch NanoDetNeck."""
+    """1x1 lateral convs to a common channel count, then a full PAN pass:
+    top-down nearest-upsample-and-add (as before) followed by a bottom-up
+    strided-downsample-and-add - the bidirectional fusion real NanoDet-Plus
+    gets from its GhostPAN neck (its Ghost module is a cheap-conv efficiency
+    trick specifically, so it's skipped here since the goal is accuracy)."""
     laterals = [layers.Conv2D(out_channels, 1, name=f"neck_lateral{i}")(f) for i, f in enumerate(feats)]
     for i in range(len(laterals) - 1, 0, -1):
-        target_hw = keras.ops.shape(laterals[i - 1])[1:3]
         up = layers.Resizing(laterals[i - 1].shape[1], laterals[i - 1].shape[2],
                               interpolation="nearest", name=f"neck_upsample{i}")(laterals[i])
         laterals[i - 1] = layers.Add(name=f"neck_add{i}")([laterals[i - 1], up])
+    for i in range(len(laterals) - 1):
+        down = pan_downsample(laterals[i], out_channels, f"neck_down{i}")
+        laterals[i + 1] = layers.Add(name=f"neck_pan_add{i}")([laterals[i + 1], down])
     return laterals
 
 
@@ -210,11 +239,14 @@ class Scale(keras.layers.Layer):
         return x * self.scale
 
 
-def build_head(feats, num_classes, feat_channels, stacked_convs, strides):
+def build_head(feats, num_classes, feat_channels, stacked_convs, strides, reg_max):
     cls_convs = [DepthwiseSeparableConv(feat_channels, name=f"head_cls_conv{i}") for i in range(stacked_convs)]
     reg_convs = [DepthwiseSeparableConv(feat_channels, name=f"head_reg_conv{i}") for i in range(stacked_convs)]
     cls_pred = layers.Conv2D(num_classes, 3, padding="same", name="head_cls_pred")
-    reg_pred = layers.Conv2D(4, 3, padding="same", name="head_reg_pred")
+    # 4*(reg_max+1): a discrete probability distribution over 0..reg_max per
+    # side (left/top/right/bottom), decoded via integral_distribution_*() -
+    # DFL, not a direct scalar regression.
+    reg_pred = layers.Conv2D(4 * (reg_max + 1), 3, padding="same", name="head_reg_pred")
 
     cls_scores, bbox_preds = [], []
     for level, (feat, stride) in enumerate(zip(feats, strides)):
@@ -229,27 +261,37 @@ def build_head(feats, num_classes, feat_channels, stacked_convs, strides):
     return cls_scores, bbox_preds
 
 
-def build_model(num_classes, image_size, feat_channels=FEAT_CHANNELS, stacked_convs=STACKED_CONVS, strides=STRIDES):
+def build_model(num_classes, image_size, feat_channels=FEAT_CHANNELS, stacked_convs=STACKED_CONVS,
+                 strides=STRIDES, reg_max=REG_MAX):
     image_input = layers.Input(shape=(image_size, image_size, 3), name="image")
     feats = build_shufflenet_v2_backbone(image_input)
     neck_feats = build_neck(feats, feat_channels)
-    cls_scores, bbox_preds = build_head(neck_feats, num_classes, feat_channels, stacked_convs, strides)
+    cls_scores, bbox_preds = build_head(neck_feats, num_classes, feat_channels, stacked_convs, strides, reg_max)
     model = keras.Model(inputs=image_input, outputs=cls_scores + bbox_preds, name="nanodet_tf")
     convert_shufflenet_weights(model)
     return model
 
 
+def load_image(image_path, img_size):
+    img = tf.io.decode_image(tf.io.read_file(str(image_path)), channels=3, expand_animations=False)
+    img = tf.image.resize(img, (img_size, img_size), method="bilinear").numpy()
+    img = (img / 255.0 - IMAGENET_MEAN) / IMAGENET_STD
+    return img.astype(np.float32)
+
+
 def load_split(split_dir, img_size):
+    # Returns image *paths*, not decoded arrays - decoding every image in a
+    # split upfront (as this used to) holds the whole split as float32 in
+    # memory at once (18287 train images at img_size=320 is ~22.5GB, more
+    # than this repo's 16GB dev machine has - confirmed via an actual OOM
+    # kill, exit code 137). Callers load_image() lazily per-batch instead
+    # (see main()'s training loop and evaluate() below).
     images_dir = split_dir / "images"
     labels_dir = split_dir / "labels"
     image_paths = sorted(p for p in images_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS)
 
-    images, all_boxes, all_labels = [], [], []
+    image_path_strings, all_boxes, all_labels = [], [], []
     for image_path in image_paths:
-        img = tf.io.decode_image(tf.io.read_file(str(image_path)), channels=3, expand_animations=False)
-        img = tf.image.resize(img, (img_size, img_size), method="bilinear").numpy()
-        img = (img / 255.0 - IMAGENET_MEAN) / IMAGENET_STD
-
         boxes, labels = [], []
         label_path = labels_dir / f"{image_path.stem}.txt"
         if label_path.exists():
@@ -264,11 +306,11 @@ def load_split(split_dir, img_size):
                 boxes.append([x1, y1, x2, y2])
                 labels.append(int(cls_id))
 
-        images.append(img.astype(np.float32))
+        image_path_strings.append(str(image_path))
         all_boxes.append(np.array(boxes, dtype=np.float32).reshape(-1, 4))
         all_labels.append(np.array(labels, dtype=np.int64))
 
-    return images, all_boxes, all_labels
+    return image_path_strings, all_boxes, all_labels
 
 
 def generate_points(feat_size, stride):
@@ -279,11 +321,35 @@ def generate_points(feat_size, stride):
     return np.stack([grid_x.reshape(-1), grid_y.reshape(-1)], axis=-1)  # [H*W, 2]
 
 
-def assign_targets(points, ranges_per_point, gt_boxes, gt_labels, num_classes):
-    """Pure-numpy port of the PyTorch trainer's FCOS-style assignment - no
-    gradient needed here (matches its @torch.no_grad()), since this only
-    depends on fixed anchor points and ground-truth labels, never on model
-    output."""
+def box_iou_np(boxes1, boxes2):
+    """Vectorized IoU matrix between two sets of xyxy boxes -> [len(boxes1), len(boxes2)]."""
+    x1 = np.maximum(boxes1[:, None, 0], boxes2[None, :, 0])
+    y1 = np.maximum(boxes1[:, None, 1], boxes2[None, :, 1])
+    x2 = np.minimum(boxes1[:, None, 2], boxes2[None, :, 2])
+    y2 = np.minimum(boxes1[:, None, 3], boxes2[None, :, 3])
+    inter = np.maximum(x2 - x1, 0) * np.maximum(y2 - y1, 0)
+    area1 = np.maximum(boxes1[:, 2] - boxes1[:, 0], 0) * np.maximum(boxes1[:, 3] - boxes1[:, 1], 0)
+    area2 = np.maximum(boxes2[:, 2] - boxes2[:, 0], 0) * np.maximum(boxes2[:, 3] - boxes2[:, 1], 0)
+    union = area1[:, None] + area2[None, :] - inter
+    return inter / np.maximum(union, 1e-7)
+
+
+def simota_assign_targets(points, gt_boxes, gt_labels, pred_scores, pred_boxes, num_classes,
+                           candidate_topk=SIMOTA_CANDIDATE_TOPK, iou_cost_weight=3.0):
+    """Dynamic soft label assignment (SimOTA-style, as used by NanoDet-Plus/
+    YOLOX) - replaces the old FCOS nearest-area rule. Builds a per-image cost
+    matrix (classification cost + IoU cost) between every ground-truth box
+    and every candidate point (center inside that box), gives each GT its
+    own dynamic top-k lowest-cost points (k from the sum of its top-`candidate_topk`
+    IoUs, so bigger/better-matched GTs claim more points), then resolves any
+    point claimed by more than one GT by lowest cost.
+
+    pred_scores/pred_boxes are the model's own current predictions, already
+    detached to plain numpy by the caller - no gradient needed here, same
+    @torch.no_grad() convention the FCOS assigner this replaces used. The
+    positive classification target is the matched box's IoU (a continuous
+    0-1 quality score for the quality focal loss), not a hard 1.0.
+    """
     num_points = points.shape[0]
     cls_targets = np.zeros((num_points, num_classes), dtype=np.float32)
     reg_targets = np.zeros((num_points, 4), dtype=np.float32)
@@ -294,30 +360,73 @@ def assign_targets(points, ranges_per_point, gt_boxes, gt_labels, num_classes):
 
     xs, ys = points[:, 0:1], points[:, 1:2]  # [P, 1]
     x1, y1, x2, y2 = gt_boxes[:, 0], gt_boxes[:, 1], gt_boxes[:, 2], gt_boxes[:, 3]  # [N]
-
     ltrb = np.stack([
         xs - x1[None, :], ys - y1[None, :], x2[None, :] - xs, y2[None, :] - ys,
     ], axis=-1)  # [P, N, 4]
-
     inside_box = ltrb.min(axis=-1) > 0  # [P, N]
-    max_ltrb = ltrb.max(axis=-1)  # [P, N]
-    low, high = ranges_per_point[:, 0:1], ranges_per_point[:, 1:2]
-    inside_range = (max_ltrb >= low) & (max_ltrb <= high)
 
-    areas = (x2 - x1) * (y2 - y1)  # [N]
-    candidate_areas = np.tile(areas[None, :], (num_points, 1)).copy()
-    candidate_areas[~(inside_box & inside_range)] = np.inf
+    if not inside_box.any():
+        return cls_targets, reg_targets, pos_mask
 
-    min_idx = candidate_areas.argmin(axis=1)
-    min_area = candidate_areas[np.arange(num_points), min_idx]
-    pos_mask = min_area < np.inf
+    iou_matrix = box_iou_np(pred_boxes, gt_boxes)  # [P, N]
+    cls_cost = -np.log(pred_scores[:, gt_labels] + 1e-8)  # [P, N]
+    iou_cost = -np.log(iou_matrix + 1e-8)
+    cost = cls_cost + iou_cost_weight * iou_cost
+    cost[~inside_box] = 1e5
 
-    pos_idx = np.nonzero(pos_mask)[0]
-    assigned_gt = min_idx[pos_idx]
-    cls_targets[pos_idx, gt_labels[assigned_gt]] = 1.0
+    k = min(candidate_topk, num_points)
+    topk_ious = np.sort(iou_matrix, axis=0)[::-1][:k]  # [k, N]
+    dynamic_ks = np.clip(topk_ious.sum(axis=0).astype(int), 1, None)  # [N]
+
+    num_gt = gt_boxes.shape[0]
+    matching_matrix = np.zeros((num_points, num_gt), dtype=bool)
+    for n in range(num_gt):
+        valid = np.nonzero(inside_box[:, n])[0]
+        if valid.size == 0:
+            continue
+        n_select = min(int(dynamic_ks[n]), valid.size)
+        chosen = valid[np.argsort(cost[valid, n])[:n_select]]
+        matching_matrix[chosen, n] = True
+
+    multi_match = matching_matrix.sum(axis=1) > 1
+    for p in np.nonzero(multi_match)[0]:
+        matched_gts = np.nonzero(matching_matrix[p])[0]
+        best = matched_gts[np.argmin(cost[p, matched_gts])]
+        matching_matrix[p, :] = False
+        matching_matrix[p, best] = True
+
+    pos_idx = np.nonzero(matching_matrix.any(axis=1))[0]
+    if pos_idx.size == 0:
+        return cls_targets, reg_targets, pos_mask
+    assigned_gt = matching_matrix[pos_idx].argmax(axis=1)
+
+    pos_mask[pos_idx] = True
+    cls_targets[pos_idx, gt_labels[assigned_gt]] = iou_matrix[pos_idx, assigned_gt]
     reg_targets[pos_idx] = ltrb[pos_idx, assigned_gt]
 
     return cls_targets, reg_targets, pos_mask
+
+
+def integral_distribution_np(dist_logits, reg_max):
+    """Numpy counterpart of integral_distribution_tf, for inference/eval
+    decode outside the training graph - see that function's docstring."""
+    dist_logits = dist_logits.reshape(-1, 4, reg_max + 1)
+    exps = np.exp(dist_logits - dist_logits.max(axis=-1, keepdims=True))
+    probs = exps / exps.sum(axis=-1, keepdims=True)
+    bins = np.arange(reg_max + 1, dtype=np.float32)
+    return (probs * bins).sum(axis=-1)  # [-1, 4], distance in stride units
+
+
+def integral_distribution_tf(dist_logits, reg_max):
+    """Softmax-weighted integral over the reg_max+1 discrete distance bins
+    (Distribution Focal Loss decode): converts each side's (left/top/right/
+    bottom) probability distribution over integer distances into one
+    continuous distance, in stride units - differentiable, used inside
+    compute_loss's GIoU path in place of the old direct exp() regression."""
+    dist_logits = keras.ops.reshape(dist_logits, (-1, 4, reg_max + 1))
+    probs = keras.ops.softmax(dist_logits, axis=-1)
+    bins = keras.ops.arange(reg_max + 1, dtype="float32")
+    return keras.ops.sum(probs * bins, axis=-1)  # [-1, 4]
 
 
 def generalized_box_iou_loss(pred_boxes, target_boxes):
@@ -341,22 +450,49 @@ def generalized_box_iou_loss(pred_boxes, target_boxes):
     return tf.reduce_sum(1.0 - giou)
 
 
-FOCAL_LOSS = keras.losses.BinaryFocalCrossentropy(
-    apply_class_balancing=True, alpha=0.25, gamma=2.0, from_logits=True, reduction="sum",
-)
+def quality_focal_loss(cls_target, cls_logits, beta=2.0):
+    """Quality Focal Loss (Generalized Focal Loss): sigmoid binary
+    cross-entropy scaled by |target - sigmoid(logit)|**beta, so confident-
+    and-wrong predictions are penalized hardest. `cls_target` is the
+    continuous IoU quality score from simota_assign_targets (0 at negatives),
+    not a hard 0/1 label - this is what ties classification confidence to
+    localization quality. Sum reduction, same convention as the
+    BinaryFocalCrossentropy it replaces."""
+    pred_sigmoid = keras.ops.sigmoid(cls_logits)
+    scale_factor = keras.ops.abs(cls_target - pred_sigmoid) ** beta
+    bce = keras.ops.binary_crossentropy(cls_target, cls_logits, from_logits=True)
+    return keras.ops.sum(bce * scale_factor)
 
 
-def compute_loss(cls_scores, bbox_preds, batch_boxes, batch_labels, strides, regress_ranges, num_classes):
+def distribution_focal_loss(pred_logits, target_dist_units, reg_max):
+    """Distribution Focal Loss: cross-entropy against the two integer bins
+    straddling the (fractional) target distance, weighted by proximity -
+    trains the per-side distribution itself to be sharp and accurate, on top
+    of the GIoU loss on the decoded box. `target_dist_units` is in stride
+    units (pre-multiply-by-stride), matching integral_distribution_*()'s
+    output space. Sum reduction, matching the file's other losses."""
+    pred_logits = keras.ops.reshape(pred_logits, (-1, 4, reg_max + 1))
+    target_dist_units = np.clip(target_dist_units, 0.0, float(reg_max) - 1e-3)
+    left = np.floor(target_dist_units).astype(np.int64)
+    right = left + 1
+    weight_left = right.astype(np.float32) - target_dist_units
+    weight_right = target_dist_units - left.astype(np.float32)
+
+    log_probs = pred_logits - keras.ops.logsumexp(pred_logits, axis=-1, keepdims=True)
+    ce_left = -keras.ops.take_along_axis(log_probs, left[..., None], axis=-1)[..., 0]
+    ce_right = -keras.ops.take_along_axis(log_probs, right[..., None], axis=-1)[..., 0]
+    loss = ce_left * weight_left + ce_right * weight_right  # [num_pos, 4]
+    return keras.ops.sum(loss)
+
+
+def compute_loss(cls_scores, bbox_preds, batch_boxes, batch_labels, strides, reg_max, num_classes):
     batch_size = cls_scores[0].shape[0]
 
-    points_per_level, ranges_per_level = [], []
-    for cls_score, stride, rng in zip(cls_scores, strides, regress_ranges):
+    points_per_level = []
+    for cls_score, stride in zip(cls_scores, strides):
         h, w = cls_score.shape[1], cls_score.shape[2]
-        points = generate_points((h, w), stride)
-        points_per_level.append(points)
-        ranges_per_level.append(np.tile(np.array(rng, dtype=np.float32), (points.shape[0], 1)))
+        points_per_level.append(generate_points((h, w), stride))
     all_points = np.concatenate(points_per_level, axis=0)
-    all_ranges = np.concatenate(ranges_per_level, axis=0)
     all_strides = np.concatenate([
         np.full((p.shape[0],), s, dtype=np.float32) for p, s in zip(points_per_level, strides)
     ])
@@ -365,17 +501,31 @@ def compute_loss(cls_scores, bbox_preds, batch_boxes, batch_labels, strides, reg
         [keras.ops.reshape(cs, (batch_size, -1, num_classes)) for cs in cls_scores], axis=1,
     )  # [B, P, C]
     flat_reg = keras.ops.concatenate(
-        [keras.ops.reshape(bp, (batch_size, -1, 4)) for bp in bbox_preds], axis=1,
-    )  # [B, P, 4] (pre-exp, pre-stride)
+        [keras.ops.reshape(bp, (batch_size, -1, 4 * (reg_max + 1))) for bp in bbox_preds], axis=1,
+    )  # [B, P, 4*(reg_max+1)] raw per-side distribution logits
 
     total_cls_loss = 0.0
     total_reg_loss = 0.0
+    total_dfl_loss = 0.0
     total_pos = 0
     for b in range(batch_size):
-        cls_target, reg_target, pos_mask = assign_targets(
-            all_points, all_ranges, batch_boxes[b], batch_labels[b], num_classes,
+        # Detached (numpy) copies of this image's own current predictions,
+        # used only to compute the SimOTA assignment cost - no gradient
+        # flows through the assignment itself, same as the FCOS assigner
+        # this replaces.
+        pred_scores_np = np.array(keras.ops.sigmoid(flat_cls[b]))
+        pred_dist_units_np = integral_distribution_np(np.array(flat_reg[b]), reg_max)
+        pred_boxes_np = np.stack([
+            all_points[:, 0] - pred_dist_units_np[:, 0] * all_strides,
+            all_points[:, 1] - pred_dist_units_np[:, 1] * all_strides,
+            all_points[:, 0] + pred_dist_units_np[:, 2] * all_strides,
+            all_points[:, 1] + pred_dist_units_np[:, 3] * all_strides,
+        ], axis=-1)
+
+        cls_target, reg_target, pos_mask = simota_assign_targets(
+            all_points, batch_boxes[b], batch_labels[b], pred_scores_np, pred_boxes_np, num_classes,
         )
-        total_cls_loss = total_cls_loss + FOCAL_LOSS(cls_target, flat_cls[b])
+        total_cls_loss = total_cls_loss + quality_focal_loss(cls_target, flat_cls[b])
 
         num_pos = int(pos_mask.sum())
         total_pos += num_pos
@@ -385,7 +535,9 @@ def compute_loss(cls_scores, bbox_preds, batch_boxes, batch_labels, strides, reg
         pos_idx = np.nonzero(pos_mask)[0]
         pts = all_points[pos_idx]
         strides_pos = all_strides[pos_idx]
-        pred_dist = keras.ops.exp(keras.ops.take(flat_reg[b], pos_idx, axis=0)) * strides_pos[:, None]
+        pred_logits_pos = keras.ops.take(flat_reg[b], pos_idx, axis=0)  # [num_pos, 4*(reg_max+1)]
+        pred_dist_units = integral_distribution_tf(pred_logits_pos, reg_max)  # [num_pos, 4], differentiable
+        pred_dist = pred_dist_units * strides_pos[:, None]
         pred_boxes = keras.ops.stack([
             pts[:, 0] - pred_dist[:, 0], pts[:, 1] - pred_dist[:, 1],
             pts[:, 0] + pred_dist[:, 2], pts[:, 1] + pred_dist[:, 3],
@@ -397,21 +549,26 @@ def compute_loss(cls_scores, bbox_preds, batch_boxes, batch_labels, strides, reg
         ], axis=-1)
         total_reg_loss = total_reg_loss + generalized_box_iou_loss(pred_boxes, target_boxes)
 
+        target_dist_units = target_dist / strides_pos[:, None]
+        total_dfl_loss = total_dfl_loss + distribution_focal_loss(pred_logits_pos, target_dist_units, reg_max)
+
     num_pos = max(total_pos, 1)
-    return total_cls_loss / num_pos, total_reg_loss / num_pos
+    return total_cls_loss / num_pos, total_reg_loss / num_pos, total_dfl_loss / num_pos
 
 
-def decode_single(cls_scores, bbox_preds, strides, img_size,
+def decode_single(cls_scores, bbox_preds, strides, img_size, reg_max,
                    score_thresh=EVAL_SCORE_THRESH, nms_iou=NMS_IOU_THRESH, max_dets=MAX_DETECTIONS):
-    """Single-image decode: raw per-level (h,w,C)/(h,w,4) arrays -> boxes/scores/labels.
-    Runs entirely outside any traced graph - same post-processing-not-part-
-    of-forward() design as the PyTorch trainer's decode_single()."""
+    """Single-image decode: raw per-level (h,w,C)/(h,w,4*(reg_max+1)) arrays
+    -> boxes/scores/labels. Runs entirely outside any traced graph - same
+    post-processing-not-part-of-forward() design as the PyTorch trainer's
+    decode_single()."""
     all_boxes, all_scores, all_labels = [], [], []
     for cls_score, bbox_pred, stride in zip(cls_scores, bbox_preds, strides):
         h, w = cls_score.shape[0], cls_score.shape[1]
         points = generate_points((h, w), stride)
         scores = 1.0 / (1.0 + np.exp(-cls_score.reshape(-1, cls_score.shape[-1])))
-        dist = np.exp(bbox_pred.reshape(-1, 4)) * stride
+        dist_units = integral_distribution_np(bbox_pred.reshape(-1, 4 * (reg_max + 1)), reg_max)
+        dist = dist_units * stride
 
         labels = scores.argmax(axis=1)
         max_scores = scores[np.arange(scores.shape[0]), labels]
@@ -437,10 +594,10 @@ def decode_single(cls_scores, bbox_preds, strides, img_size,
     return boxes[keep], scores[keep], labels[keep]
 
 
-def evaluate(model, images, batch_boxes, batch_labels, img_size, batch_size=16):
+def evaluate(model, image_paths, batch_boxes, batch_labels, img_size, reg_max, batch_size=16):
     metric = MeanAveragePrecision(box_format="xyxy")
-    for start in range(0, len(images), batch_size):
-        batch = np.stack(images[start:start + batch_size])
+    for start in range(0, len(image_paths), batch_size):
+        batch = np.stack([load_image(p, img_size) for p in image_paths[start:start + batch_size]])
         outputs = model(batch, training=False)
         cls_scores, bbox_preds = outputs[:3], outputs[3:]
         cls_scores = [np.array(c) for c in cls_scores]
@@ -449,7 +606,7 @@ def evaluate(model, images, batch_boxes, batch_labels, img_size, batch_size=16):
         preds, targets = [], []
         for i in range(batch.shape[0]):
             boxes, scores, labels = decode_single(
-                [c[i] for c in cls_scores], [b[i] for b in bbox_preds], STRIDES, img_size,
+                [c[i] for c in cls_scores], [b[i] for b in bbox_preds], STRIDES, img_size, reg_max,
             )
             preds.append({
                 "boxes": torch.from_numpy(boxes), "scores": torch.from_numpy(scores),
@@ -465,6 +622,33 @@ def evaluate(model, images, batch_boxes, batch_labels, img_size, batch_size=16):
     return float(result["map_50"]), float(result["map"])
 
 
+class EMA:
+    """Exponential moving average of trainable variables (NanoDet-Plus's
+    ExpMovingAverager). update() runs after every optimizer step;
+    swap_in()/swap_out() temporarily install the shadow weights for
+    eval+checkpointing, then restore the live (non-EMA) weights so training
+    continues on those, not the average."""
+
+    def __init__(self, variables, decay):
+        self.decay = decay
+        self.shadow = [tf.Variable(v, trainable=False) for v in variables]
+        self.backup = None
+
+    def update(self, variables):
+        for s, v in zip(self.shadow, variables):
+            s.assign(self.decay * s + (1.0 - self.decay) * v)
+
+    def swap_in(self, variables):
+        self.backup = [tf.Variable(v) for v in variables]
+        for v, s in zip(variables, self.shadow):
+            v.assign(s)
+
+    def swap_out(self, variables):
+        for v, b in zip(variables, self.backup):
+            v.assign(b)
+        self.backup = None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data", default="data_detect/data.yaml")
@@ -472,8 +656,16 @@ def main():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--img-size", type=int, default=320)
     parser.add_argument("--lr", type=float, default=0.01)
+    parser.add_argument("--reg-max", type=int, default=REG_MAX,
+                         help="DFL: number of distance bins per side is reg_max+1")
+    parser.add_argument("--ema-decay", type=float, default=EMA_DECAY,
+                         help="exponential moving average decay for eval/checkpoint weights")
     parser.add_argument("--output", default="models/nanodet_tf_best.keras")
+    parser.add_argument("--log-dir", default="logs", help="Directory for this run's log file")
     args = parser.parse_args()
+
+    emit, log_path = make_emitter(args.log_dir)
+    emit(f"Logging to {log_path}")
 
     data_yaml_path = Path(args.data)
     if not data_yaml_path.exists():
@@ -486,13 +678,14 @@ def main():
     class_names = [class_names_dict[i] for i in sorted(class_names_dict)]
     num_classes = len(class_names)
 
-    print("Loading dataset ...")
+    emit("Loading dataset ...")
     train_images, train_boxes, train_labels = load_split(data_root / "train", args.img_size)
     val_images, val_boxes, val_labels = load_split(data_root / "val", args.img_size)
-    print(f"Train: {len(train_images)} images  Val: {len(val_images)} images")
+    emit(f"Train: {len(train_images)} images  Val: {len(val_images)} images")
 
-    model = build_model(num_classes, args.img_size)
+    model = build_model(num_classes, args.img_size, reg_max=args.reg_max)
     optimizer = keras.optimizers.SGD(learning_rate=args.lr, momentum=0.9, weight_decay=0.0001)
+    ema = EMA(model.trainable_variables, args.ema_decay)
     step_size = max(args.epochs // 3, 1)
 
     output_path = Path(args.output)
@@ -506,36 +699,41 @@ def main():
         perm = np.random.permutation(n)
         epoch_loss = 0.0
         num_batches = max(n // args.batch_size, 1)
-        for bi in range(num_batches):
+        progress = tqdm(range(num_batches), desc=f"Epoch {epoch}/{args.epochs}", unit="batch")
+        for bi in progress:
             idx = perm[bi * args.batch_size:(bi + 1) * args.batch_size]
             if len(idx) == 0:
                 continue
-            batch_images = np.stack([train_images[i] for i in idx])
+            batch_images = np.stack([load_image(train_images[i], args.img_size) for i in idx])
             batch_boxes = [train_boxes[i] for i in idx]
             batch_labels = [train_labels[i] for i in idx]
 
             with tf.GradientTape() as tape:
                 outputs = model(batch_images, training=True)
                 cls_scores, bbox_preds = outputs[:3], outputs[3:]
-                cls_loss, reg_loss = compute_loss(
-                    cls_scores, bbox_preds, batch_boxes, batch_labels, STRIDES, REGRESS_RANGES, num_classes,
+                cls_loss, reg_loss, dfl_loss = compute_loss(
+                    cls_scores, bbox_preds, batch_boxes, batch_labels, STRIDES, args.reg_max, num_classes,
                 )
-                loss = cls_loss + REG_LOSS_WEIGHT * reg_loss
+                loss = cls_loss + REG_LOSS_WEIGHT * reg_loss + DFL_LOSS_WEIGHT * dfl_loss
             grads = tape.gradient(loss, model.trainable_variables)
             optimizer.apply_gradients(zip(grads, model.trainable_variables))
+            ema.update(model.trainable_variables)
             epoch_loss += float(loss)
+            progress.set_postfix(loss=f"{float(loss):.4f}")
 
-        map50, map5095 = evaluate(model, val_images, val_boxes, val_labels, args.img_size)
-        print(f"Epoch {epoch}/{args.epochs}  loss={epoch_loss / num_batches:.4f}  "
-              f"val mAP50={map50:.4f}  val mAP50-95={map5095:.4f}")
+        ema.swap_in(model.trainable_variables)
+        map50, map5095 = evaluate(model, val_images, val_boxes, val_labels, args.img_size, args.reg_max)
+        emit(f"Epoch {epoch}/{args.epochs}  loss={epoch_loss / num_batches:.4f}  "
+             f"val mAP50={map50:.4f}  val mAP50-95={map5095:.4f}")
 
         if map50 > best_map50:
             best_map50 = map50
             model.save(output_path)
+        ema.swap_out(model.trainable_variables)
 
-    print(f"\nSaved best model to {output_path} (val mAP50={best_map50:.4f})")
-    print(f"Class names ({num_classes}): {class_names}")
-    print(
+    emit(f"\nSaved best model to {output_path} (val mAP50={best_map50:.4f})")
+    emit(f"Class names ({num_classes}): {class_names}")
+    emit(
         "\nRun 'python src/evaluate_models.py --model-path "
         f"{output_path}' for precision/recall/F1 on the test split."
     )

@@ -1,6 +1,6 @@
 """
-    python src/run_camera_mobilenetv4_detect.py --model-path models/mobilenetv4_mobilenetv4_conv_medium_detect_best.pt --source webcam
-    python src/run_camera_mobilenetv4_detect.py --model-path models/mobilenetv4_mobilenetv4_conv_medium_detect_best.pt --source droidcam \
+    python src/run/run_camera_mobilenetv4_fasterrcnn_detect.py --model-path models/mobilenetv4_mobilenetv4_conv_medium_detect_best.pt --source webcam
+    python src/run/run_camera_mobilenetv4_fasterrcnn_detect.py --model-path models/mobilenetv4_mobilenetv4_conv_medium_detect_best.pt --source droidcam \
         --droidcam-ip 192.168.0.107 --droidcam-port 4747
 """
 import argparse
@@ -24,9 +24,9 @@ from torchvision.ops import FeaturePyramidNetwork
 from torchvision.ops.feature_pyramid_network import LastLevelMaxPool
 from torchvision.transforms.functional import to_tensor
 
-logger = logging.getLogger("camera_mobilenetv4_detect")
+logger = logging.getLogger("camera_mobilenetv4_fasterrcnn_detect")
 
-# Must match train_mobilenetv4_detect.py's FPN_OUT_INDICES exactly
+# Must match train_mobilenetv4_fasterrcnn_detect.py's FPN_OUT_INDICES exactly
 FPN_OUT_INDICES = (1, 2, 3, 4)
 
 

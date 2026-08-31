@@ -28,13 +28,13 @@ from torchvision.ops import box_iou
 from run_camera_resnet_tf_detect import load_model as load_resnet_tf, detect as detect_resnet_tf
 import run_camera_mobilenet_tf_detect  # noqa: F401 - side effect only: registers PyramidMobileNetBackbone
                                         # so keras.saving.load_model() can deserialize a MobileNet-TF checkpoint
-from run_camera_mobilenetv4_detect import get_device as get_device_mobilenetv4, load_model as load_mobilenetv4, \
-    detect as detect_mobilenetv4
-from run_camera_nanodet_tf_detect import load_model as load_nanodet_tf, detect as detect_nanodet_tf
+from run_camera_mobilenetv4_fasterrcnn_detect import get_device as get_device_mobilenetv4, \
+    load_model as load_mobilenetv4, detect as detect_mobilenetv4
+from run_camera_nanodet_tf_detect import detect as detect_nanodet_tf
 from run_camera_resnet_fasterrcnn_detect import get_device as get_device_resnet_fasterrcnn, \
     load_model as load_resnet_fasterrcnn, detect as detect_resnet_fasterrcnn
-from run_camera_mobilenetv3_detect import get_device as get_device_mobilenetv3, load_model as load_mobilenetv3, \
-    detect as detect_mobilenetv3
+from run_camera_mobilenetv3_fasterrcnn_detect import get_device as get_device_mobilenetv3, \
+    load_model as load_mobilenetv3, detect as detect_mobilenetv3
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
@@ -90,19 +90,11 @@ def load_yolo(path_str, conf):
 
 
 def identify_and_load(model_path, conf, data_yaml):
-    """Returns (family_label, model_class_names, predictor) where predictor(frame)
-    -> list of (x1, y1, x2, y2, class_name, score) in original-frame pixel space,
-    already filtered to score >= conf."""
     path_str = str(model_path)
     if Path(path_str).name.lower().startswith("yolo"):
         return load_yolo(path_str, conf)
 
     if path_str.endswith(".keras"):
-        # load_model()/detect() are backbone-agnostic (KerasHub serializes the
-        # whole RetinaNetObjectDetector, backbone included) - identical code
-        # works for any TF/KerasHub RetinaNet checkpoint. NanoDet-TF is a
-        # plain keras.Model instead (no .backbone/.preprocessor attrs, raw
-        # per-level cls_scores/bbox_preds output) - detected by their absence.
         model, class_names = load_resnet_tf(path_str, data_yaml)
         if hasattr(model, "backbone") and hasattr(model, "preprocessor"):
             encoder_name = type(model.backbone.image_encoder).__name__
@@ -130,9 +122,6 @@ def identify_and_load(model_path, conf, data_yaml):
         ckpt = None
 
     if isinstance(ckpt, dict) and "family" in ckpt:
-        # Ready-made torchvision Faster R-CNN constructors (ResNet, MobileNetV3) -
-        # the checkpoint names its own family explicitly rather than needing
-        # inference from a backbone-name string.
         if ckpt["family"] == "resnet-fasterrcnn":
             device = get_device_resnet_fasterrcnn()
             model, class_names = load_resnet_fasterrcnn(path_str, device)
@@ -151,7 +140,6 @@ def identify_and_load(model_path, conf, data_yaml):
         predictor = lambda frame: detect_mobilenetv4(model, class_names, frame, device, conf)
         return family, class_names, predictor
 
-    # Not YOLO-named, and not one of the remaining custom checkpoint dict shapes either.
     got = (f"a dict with keys {sorted(ckpt.keys())}" if isinstance(ckpt, dict)
            else "nothing (torch.load failed)" if ckpt is None
            else type(ckpt).__name__)
@@ -180,11 +168,6 @@ def load_ground_truth(label_path, img_w, img_h, class_names):
 
 
 def match_image(preds, gts, name_to_idx, iou_thres, matrix):
-    """Same greedy-IoU-match convention as Ultralytics' ConfusionMatrix.process_batch:
-    matched pairs -> matrix[pred_class, gt_class] += 1 (diagonal = TP, off-diagonal
-    is simultaneously an FP for the predicted class and an FN for the true class);
-    unmatched predictions -> matrix[pred_class, background] += 1 (FP); unmatched
-    ground truth -> matrix[background, gt_class] += 1 (FN)."""
     nc = len(name_to_idx)
 
     if not gts:

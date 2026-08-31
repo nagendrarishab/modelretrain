@@ -1,14 +1,4 @@
-"""Convert a trained TF/Keras detector to a float16-quantized TFLite module
-for on-device inference. Handles two different model
-shapes in this repo, auto-detected from the loaded checkpoint:
-
-Uses TFLiteConverter.from_saved_model() rather than
-from_concrete_functions(): the latter hits an unrelated AttributeError deep
-in the converter's debug-info step specifically when SELECT_TF_OPS is
-needed (a converter bug, not something fixable from calling code), while
-routing through an intermediate SavedModel on disk avoids it.
-
-Usage:
+"""
     python src/convert_tflite.py --checkpoint models/resnet_tf_resnet50_detect_best.keras \
         --output models/resnet_tf_resnet50_detect_best_fp16.tflite
     python src/convert_tflite.py --checkpoint models/nanodet_tf_best.keras \
@@ -25,7 +15,8 @@ import tensorflow as tf
 from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "run"))
-import run_camera_nanodet_tf_detect
+import run_camera_nanodet_tf_detect  # noqa: F401 - side effect only: registers the custom NanoDet-TF
+                                      # layer classes so keras.saving.load_model() can deserialize a checkpoint
 import run_camera_mobilenet_tf_detect  # noqa: F401 - side effect only: registers PyramidMobileNetBackbone
                                         # so keras.saving.load_model() can deserialize a MobileNet-TF checkpoint
 

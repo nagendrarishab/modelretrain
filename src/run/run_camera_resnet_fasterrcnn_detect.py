@@ -42,10 +42,6 @@ def setup_logging(log_dir):
 
 
 def get_device():
-    # No MPS branch: same numerical-instability reasoning as the other
-    # torchvision Faster R-CNN camera scripts - this architecture's
-    # ROIAlign/NMS ops are unreliable on Apple's MPS backend with this
-    # torch/torchvision version, regardless of backbone.
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")

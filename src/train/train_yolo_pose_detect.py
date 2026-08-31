@@ -4,13 +4,6 @@
     # resume a run that got killed partway through (points at its last.pt)
     python src/train_yolo_pose_detect.py --model yolo26n-pose.pt --epochs 50 \
         --resume runs/pose/box_open_closed_yolo_pose/weights/last.pt
-
-Same training-settings surface as train_yolo_detect.py - this is still a
-plain Ultralytics YOLO().train()/.val() call, just on a pose model instead
-of a detect model, so every BaseTrainer-level setting (augmentation,
-patience/freeze/time/save-period/resume/cos-lr/fraction/min-samples-per-class)
-applies identically. See train_yolo_detect.py's docstring/--help for the
-per-setting rationale; not repeated here.
 """
 import argparse
 import os
@@ -184,8 +177,8 @@ def main():
     parser.add_argument("--data", default="data_detect/data.yaml",
                          help="box-detection dataset (from prepare_detect_dataset.py) to derive corner keypoints from")
     parser.add_argument("--pose-data-dir", default="data_pose",
-                         help="where the derived pose-format dataset lives; reused as-is if it already "
-                              "has a data.yaml, otherwise (re)built from --data")
+                         help="where the derived pose-format dataset lives; deleted and rebuilt fresh "
+                              "from --data on every run")
     parser.add_argument("--model", default="yolo26n-pose.pt", choices=MODEL_CHOICES)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -263,14 +256,11 @@ def main():
     data_yaml_path = filter_low_sample_classes(data_yaml_path, args.min_samples_per_class)
 
     pose_data_dir = Path(args.pose_data_dir)
-    existing_pose_yaml = pose_data_dir / "data.yaml"
-    if existing_pose_yaml.exists():
-        pose_yaml_path = existing_pose_yaml
-        print(f"Reusing existing pose dataset at {pose_data_dir} (data.yaml already present) - "
-              f"delete this directory first to rebuild it from --data")
-    else:
-        pose_yaml_path = build_pose_dataset(data_yaml_path, pose_data_dir)
-        print(f"Derived pose dataset at {pose_data_dir} (4 box-corner keypoints per box)")
+    if pose_data_dir.exists():
+        shutil.rmtree(pose_data_dir)
+        print(f"Removed existing pose dataset at {pose_data_dir}")
+    pose_yaml_path = build_pose_dataset(data_yaml_path, pose_data_dir)
+    print(f"Derived pose dataset at {pose_data_dir} (4 box-corner keypoints per box)")
 
     device = str(get_device())
     print(f"Using device: {device}")

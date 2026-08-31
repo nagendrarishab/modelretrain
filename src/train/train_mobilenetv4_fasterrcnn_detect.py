@@ -1,51 +1,74 @@
 """
-    python src/train/train_mobilenetv3_detect.py --epochs 30
-
-Faster R-CNN on a MobileNetV3-Large backbone, using torchvision's own
-ready-made `fasterrcnn_mobilenet_v3_large_fpn`/`fasterrcnn_mobilenet_v3_large_320_fpn`
-constructors instead of hand-building a backbone+FPN wrapper (unlike
-train_mobilenetv4_detect.py, which has to - torchvision has no MobileNetV4
-at all). MobileNetV3 is one of the only two backbones (the other being
-ResNet) torchvision ships a ready-made Faster R-CNN constructor for.
-
-Both constructors default to `weights=None` (no COCO-pretrained detection
-head to discard) and `weights_backbone=MobileNet_V3_Large_Weights.IMAGENET1K_V1`
-- matching this repo's ImageNet-only convention already, with zero custom
-code needed to get there.
+    python src/train/train_mobilenetv4_fasterrcnn_detect.py --backbone mobilenetv4_conv_medium --epochs 30
 """
 import argparse
 import os
+from collections import OrderedDict
+from datetime import datetime
 from pathlib import Path
 
 import certifi
 
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 
+import timm
 import torch
+import torch.nn as nn
 import yaml
 from PIL import Image
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
-from torchvision.models.detection import fasterrcnn_mobilenet_v3_large_fpn, fasterrcnn_mobilenet_v3_large_320_fpn
+from torchvision.models.detection import FasterRCNN
+from torchvision.ops import FeaturePyramidNetwork
+from torchvision.ops.feature_pyramid_network import LastLevelMaxPool
 from torchvision.transforms.functional import to_tensor
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 from tqdm import tqdm
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
-VARIANT_CHOICES = ["large_fpn", "large_320_fpn"]
+BACKBONE_CHOICES = ["mobilenetv4_conv_small", "mobilenetv4_conv_medium", "mobilenetv4_conv_large"]
+
+FPN_OUT_INDICES = (1, 2, 3, 4)
+
+
+def make_emitter(log_dir):
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    log_path = Path(log_dir) / f"train_mobilenetv4_fasterrcnn_{datetime.now():%Y%m%d_%H%M%S}.log"
+    log_file = open(log_path, "w")
+
+    def emit(msg):
+        print(msg)
+        log_file.write(msg + "\n")
+        log_file.flush()
+
+    return emit, log_path
 
 
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
     return torch.device("cpu")
 
 
-class YoloFormatDataset(Dataset):
+class MobileNetV4Backbone(nn.Module):
 
+    def __init__(self, backbone_name, out_channels=256):
+        super().__init__()
+        self.body = timm.create_model(
+            backbone_name, pretrained=True, features_only=True, out_indices=FPN_OUT_INDICES,
+        )
+        self.fpn = FeaturePyramidNetwork(
+            self.body.feature_info.channels(), out_channels, extra_blocks=LastLevelMaxPool(),
+        )
+        self.out_channels = out_channels
+
+    def forward(self, x):
+        features = self.body(x)
+        return self.fpn(OrderedDict((str(i), f) for i, f in enumerate(features)))
+
+
+class YoloFormatDataset(Dataset):
     def __init__(self, split_dir):
         self.images_dir = split_dir / "images"
         self.labels_dir = split_dir / "labels"
@@ -97,9 +120,9 @@ def warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, f)
 
 
-def build_model(num_classes, variant):
-    ctor = fasterrcnn_mobilenet_v3_large_320_fpn if variant == "large_320_fpn" else fasterrcnn_mobilenet_v3_large_fpn
-    return ctor(weights=None, num_classes=num_classes)
+def build_model(backbone_name, num_classes):
+    backbone = MobileNetV4Backbone(backbone_name)
+    return FasterRCNN(backbone, num_classes=num_classes)
 
 
 @torch.no_grad()
@@ -118,17 +141,22 @@ def evaluate(model, data_loader, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser()
     parser.add_argument("--data", default="data_detect/data.yaml")
-    parser.add_argument("--variant", default="large_fpn", choices=VARIANT_CHOICES,
-                         help="large_fpn (higher accuracy, default input resolution) or large_320_fpn "
-                              "(lower internal resolution, faster) - both ImageNet-backbone by default")
+    parser.add_argument("--backbone", default="mobilenetv4_conv_medium", choices=BACKBONE_CHOICES)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=0.005)
-    parser.add_argument("--workers", type=int, default=4, help="DataLoader worker processes")
-    parser.add_argument("--output", default="models/mobilenetv3_detect_best.pt")
+    parser.add_argument("--output", default=None,
+                         help="Output path. Defaults to models/mobilenetv4_<backbone>_detect_best.pt")
+    parser.add_argument("--log-dir", default="logs", help="Directory for this run's log file")
     args = parser.parse_args()
+
+    if args.output is None:
+        args.output = f"models/mobilenetv4_{args.backbone}_detect_best.pt"
+
+    emit, log_path = make_emitter(args.log_dir)
+    emit(f"Logging to {log_path}")
 
     data_yaml_path = Path(args.data)
     if not data_yaml_path.exists():
@@ -143,13 +171,11 @@ def main():
     device = get_device()
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
-    print(f"Using device: {device}")
+    emit(f"Using device: {device}")
 
     loader_kwargs = dict(
         collate_fn=collate_fn,
-        num_workers=args.workers,
         pin_memory=device.type == "cuda",
-        persistent_workers=args.workers > 0,
     )
     train_loader = DataLoader(
         YoloFormatDataset(data_root / "train"), batch_size=args.batch_size,
@@ -163,10 +189,10 @@ def main():
         YoloFormatDataset(data_root / "test"), batch_size=args.batch_size,
         shuffle=False, **loader_kwargs,
     )
-    print(f"Train: {len(train_loader.dataset)} images ({len(train_loader)} batches/epoch)  "
-          f"Val: {len(val_loader.dataset)}  Test: {len(test_loader.dataset)}")
+    emit(f"Train: {len(train_loader.dataset)} images ({len(train_loader)} batches/epoch)  "
+         f"Val: {len(val_loader.dataset)}  Test: {len(test_loader.dataset)}")
 
-    model = build_model(num_classes, args.variant).to(device)
+    model = build_model(args.backbone, num_classes).to(device)
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=0.0005)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(args.epochs // 3, 1), gamma=0.1)
@@ -199,9 +225,7 @@ def main():
             if not torch.isfinite(loss):
                 breakdown = ", ".join(f"{k}={v.item():.4f}" for k, v in loss_dict.items())
                 raise RuntimeError(
-                    f"Loss went non-finite ({breakdown}) on device={device}. "
-                    f"This is the known Faster R-CNN/MPS instability - rerun with a CPU-only "
-                    f"get_device() (or on CUDA) if it recurs."
+                    f"Loss went non-finite ({breakdown}) on device={device}."
                 )
 
             optimizer.zero_grad()
@@ -215,23 +239,22 @@ def main():
 
         scheduler.step()
         map50, map5095 = evaluate(model, val_loader, device)
-        print(f"Epoch {epoch}/{args.epochs}  loss={epoch_loss / len(train_loader):.4f}  "
-              f"val mAP50={map50:.4f}  val mAP50-95={map5095:.4f}")
+        emit(f"Epoch {epoch}/{args.epochs}  loss={epoch_loss / len(train_loader):.4f}  "
+             f"val mAP50={map50:.4f}  val mAP50-95={map5095:.4f}")
 
         if map50 > best_map50:
             best_map50 = map50
             torch.save({"model_state_dict": model.state_dict(),
-                        "family": "mobilenetv3-fasterrcnn",
-                        "variant": args.variant,
+                        "backbone": args.backbone,
                         "class_names": class_names}, args.output)
 
-    print(f"\nSaved best model to {args.output} (val mAP50={best_map50:.4f})")
+    emit(f"\nSaved best model to {args.output} (val mAP50={best_map50:.4f})")
 
     best = torch.load(args.output, map_location=device, weights_only=False)
-    model = build_model(len(best["class_names"]) + 1, best["variant"]).to(device)
+    model = build_model(best["backbone"], len(best["class_names"]) + 1).to(device)
     model.load_state_dict(best["model_state_dict"])
     test_map50, test_map5095 = evaluate(model, test_loader, device)
-    print(f"Test mAP50: {test_map50:.4f}  mAP50-95: {test_map5095:.4f}")
+    emit(f"Test mAP50: {test_map50:.4f}  mAP50-95: {test_map5095:.4f}")
 
 
 if __name__ == "__main__":

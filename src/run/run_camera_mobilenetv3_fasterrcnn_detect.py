@@ -1,6 +1,6 @@
 """
-    python src/run/run_camera_mobilenetv3_detect.py --model-path models/mobilenetv3_detect_best.pt --source webcam
-    python src/run/run_camera_mobilenetv3_detect.py --model-path models/mobilenetv3_detect_best.pt --source droidcam \
+    python src/run/run_camera_mobilenetv3_fasterrcnn_detect.py --model-path models/mobilenetv3_detect_best.pt --source webcam
+    python src/run/run_camera_mobilenetv3_fasterrcnn_detect.py --model-path models/mobilenetv3_detect_best.pt --source droidcam \
         --droidcam-ip 192.168.0.107 --droidcam-port 4747
 """
 import argparse
@@ -19,7 +19,7 @@ import torch
 from torchvision.models.detection import fasterrcnn_mobilenet_v3_large_fpn, fasterrcnn_mobilenet_v3_large_320_fpn
 from torchvision.transforms.functional import to_tensor
 
-logger = logging.getLogger("camera_mobilenetv3_detect")
+logger = logging.getLogger("camera_mobilenetv3_fasterrcnn_detect")
 
 
 def setup_logging(log_dir):
@@ -42,10 +42,6 @@ def setup_logging(log_dir):
 
 
 def get_device():
-    # No MPS branch: same numerical-instability reasoning as the other
-    # torchvision Faster R-CNN camera scripts - this architecture's
-    # ROIAlign/NMS ops are unreliable on Apple's MPS backend with this
-    # torch/torchvision version, regardless of backbone.
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")

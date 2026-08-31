@@ -17,13 +17,6 @@
     python src/run_camera_yolo_pose_detect.py --model-path models/yolo26n-pose_best.pt \
         --iou 0.5 --classes 0 --agnostic-nms --save-crop
 
-Same run-time settings surface as run_camera_yolo_detect.py - this is still
-a plain Ultralytics YOLO().predict() call, just on a pose model instead of
-a detect model, so every Predictor-level setting (quantize/max-det/iou/
-classes/agnostic-nms/save-crop) applies identically, and result.boxes is
-still populated (pose results carry both result.boxes and result.keypoints).
-See run_camera_yolo_detect.py's docstring/--help for the per-setting
-rationale; not repeated here.
 """
 import argparse
 import logging

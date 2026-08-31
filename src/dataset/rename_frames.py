@@ -6,8 +6,14 @@
 
     Pass --labels-dir to also rename each image's matching YOLO-format label
     (same stem, a .txt in --labels-dir) so images and labels stay paired:
-        python src/dataset/rename_frames.py --dir data_detect/train/images \\
-            --labels-dir data_detect/train/labels --start 7000
+    python src/dataset/rename_frames.py --dir data_detect/train/images --labels-dir data_detect/train/labels --start 7000
+
+Rename multiple files in a single time with continuation
+python src/dataset/rename_frames.py --dir raw/closed --labels-dir raw_labels/closed --template "{n:07d}"
+python src/dataset/rename_frames.py --dir raw/open --labels-dir raw_labels/open --continue-dir raw/closed --template "{n:07d}"
+python src/dataset/rename_frames.py --dir raw/extra --labels-dir raw_labels/extra --continue-dir raw/open --template "{n:07d}"
+python src/dataset/rename_frames.py --dir raw/background --continue-dir raw/extra --template "{n:07d}"
+
 """
 import argparse
 import re

@@ -67,13 +67,6 @@ def open_capture(args):
 
 
 def detect(model, class_names, frame, conf_threshold, height, width):
-    # Predicted box coordinates come back in the model's fixed input
-    # resolution (height, width), not the original frame's - the
-    # preprocessor's image_converter resizes internally at predict() time
-    # but nothing rescales predictions back to the caller's input size. So
-    # every box is rescaled back to the original frame here, keeping this
-    # function's contract (original-frame pixel space) the same as every
-    # other detect() in this repo, and the same as evaluate_models.py expects.
     orig_height, orig_width = frame.shape[:2]
     resized = cv2.resize(frame, (width, height))
     rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)

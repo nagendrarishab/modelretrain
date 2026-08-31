@@ -1,20 +1,9 @@
 """
     python src/train/train_resnet_fasterrcnn_detect.py --epochs 30
-
-Faster R-CNN on a ResNet50 backbone, using torchvision's own ready-made
-`fasterrcnn_resnet50_fpn`/`fasterrcnn_resnet50_fpn_v2` constructors instead
-of hand-building a backbone+FPN wrapper (unlike train_efficientnet_detect.py
-used to, and train_mobilenetv4_detect.py still does) - ResNet is one of the
-only two backbones (the other being MobileNetV3) torchvision ships a
-ready-made Faster R-CNN constructor for; every other backbone in this repo
-needs the hand-built approach because no such constructor exists for it.
-
-Both constructors default to `weights=None` (no COCO-pretrained detection
-head to discard) - matching this repo's ImageNet-only convention already,
-with zero custom code needed to get there.
 """
 import argparse
 import os
+from datetime import datetime
 from pathlib import Path
 
 import certifi
@@ -37,11 +26,22 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 VARIANT_CHOICES = ["resnet50_fpn", "resnet50_fpn_v2"]
 
 
+def make_emitter(log_dir):
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    log_path = Path(log_dir) / f"train_resnet_fasterrcnn_{datetime.now():%Y%m%d_%H%M%S}.log"
+    log_file = open(log_path, "w")
+
+    def emit(msg):
+        print(msg)
+        log_file.write(msg + "\n")
+        log_file.flush()
+
+    return emit, log_path
+
+
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
     return torch.device("cpu")
 
 
@@ -100,11 +100,6 @@ def warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor):
 
 def build_model(num_classes, variant):
     if variant == "resnet50_fpn_v2":
-        # v2's weights_backbone defaults to None (unlike v1's IMAGENET1K_V1
-        # default) - pass it explicitly or this silently trains a
-        # random-init backbone, which would quietly contradict this
-        # project's "don't reduce accuracy" priority. Confirmed this
-        # asymmetry directly via inspect.signature(), not assumed.
         return fasterrcnn_resnet50_fpn_v2(
             weights=None, weights_backbone=ResNet50_Weights.IMAGENET1K_V1, num_classes=num_classes,
         )
@@ -137,7 +132,11 @@ def main():
     parser.add_argument("--lr", type=float, default=0.005)
     parser.add_argument("--workers", type=int, default=4, help="DataLoader worker processes")
     parser.add_argument("--output", default="models/resnet_fasterrcnn_detect_best.pt")
+    parser.add_argument("--log-dir", default="logs", help="Directory for this run's log file")
     args = parser.parse_args()
+
+    emit, log_path = make_emitter(args.log_dir)
+    emit(f"Logging to {log_path}")
 
     data_yaml_path = Path(args.data)
     if not data_yaml_path.exists():
@@ -152,7 +151,7 @@ def main():
     device = get_device()
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
-    print(f"Using device: {device}")
+    emit(f"Using device: {device}")
 
     loader_kwargs = dict(
         collate_fn=collate_fn,
@@ -172,8 +171,8 @@ def main():
         YoloFormatDataset(data_root / "test"), batch_size=args.batch_size,
         shuffle=False, **loader_kwargs,
     )
-    print(f"Train: {len(train_loader.dataset)} images ({len(train_loader)} batches/epoch)  "
-          f"Val: {len(val_loader.dataset)}  Test: {len(test_loader.dataset)}")
+    emit(f"Train: {len(train_loader.dataset)} images ({len(train_loader)} batches/epoch)  "
+         f"Val: {len(val_loader.dataset)}  Test: {len(test_loader.dataset)}")
 
     model = build_model(num_classes, args.variant).to(device)
     params = [p for p in model.parameters() if p.requires_grad]
@@ -208,9 +207,7 @@ def main():
             if not torch.isfinite(loss):
                 breakdown = ", ".join(f"{k}={v.item():.4f}" for k, v in loss_dict.items())
                 raise RuntimeError(
-                    f"Loss went non-finite ({breakdown}) on device={device}. "
-                    f"This is the known Faster R-CNN/MPS instability - rerun with a CPU-only "
-                    f"get_device() (or on CUDA) if it recurs."
+                    f"Loss went non-finite ({breakdown}) on device={device}."
                 )
 
             optimizer.zero_grad()
@@ -224,8 +221,8 @@ def main():
 
         scheduler.step()
         map50, map5095 = evaluate(model, val_loader, device)
-        print(f"Epoch {epoch}/{args.epochs}  loss={epoch_loss / len(train_loader):.4f}  "
-              f"val mAP50={map50:.4f}  val mAP50-95={map5095:.4f}")
+        emit(f"Epoch {epoch}/{args.epochs}  loss={epoch_loss / len(train_loader):.4f}  "
+             f"val mAP50={map50:.4f}  val mAP50-95={map5095:.4f}")
 
         if map50 > best_map50:
             best_map50 = map50
@@ -234,13 +231,13 @@ def main():
                         "variant": args.variant,
                         "class_names": class_names}, args.output)
 
-    print(f"\nSaved best model to {args.output} (val mAP50={best_map50:.4f})")
+    emit(f"\nSaved best model to {args.output} (val mAP50={best_map50:.4f})")
 
     best = torch.load(args.output, map_location=device, weights_only=False)
     model = build_model(len(best["class_names"]) + 1, best["variant"]).to(device)
     model.load_state_dict(best["model_state_dict"])
     test_map50, test_map5095 = evaluate(model, test_loader, device)
-    print(f"Test mAP50: {test_map50:.4f}  mAP50-95: {test_map5095:.4f}")
+    emit(f"Test mAP50: {test_map50:.4f}  mAP50-95: {test_map5095:.4f}")
 
 
 if __name__ == "__main__":
