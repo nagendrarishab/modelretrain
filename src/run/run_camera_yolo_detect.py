@@ -2,7 +2,7 @@
     python src/run_camera_yolo_detect.py --model-path models/yolo26n_best.pt --source webcam
     python src/run_camera_yolo_detect.py --model-path models/yolo26n_best.pt --source droidcam \
         --droidcam-ip 192.168.0.107 --droidcam-port 4747
-    python src/run_camera_yolo_detect.py --model-path models/yolo26n_best.pt --source file \
+    python src/run/run_camera_yolo_detect.py --model-path models/yolo26n_best.pt --source file \
         --video-path Camera_2026-08-21_17-28-33.mp4 --no-preview
 
     # FP16 inference for a faster per-frame loop (biggest win on CUDA, smaller on MPS/CPU)

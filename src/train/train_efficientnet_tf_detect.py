@@ -60,7 +60,7 @@ def load_split(split_dir, height, width):
     return image_path_strings, boxes, classes
 
 
-def make_dataset(image_paths, boxes, classes, batch_size, shuffle, height, width):
+def make_dataset(image_paths, boxes, classes, batch_size, shuffle, height, width, cache_path=None):
     def gen():
         for p, b, c in zip(image_paths, boxes, classes):
             yield p, {"boxes": b, "labels": c}
@@ -73,8 +73,6 @@ def make_dataset(image_paths, boxes, classes, batch_size, shuffle, height, width
         },
     )
     ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
-    if shuffle:
-        ds = ds.shuffle(buffer_size=len(image_paths))
 
     def read_image(path, targets):
         img = tf.io.decode_image(tf.io.read_file(path), channels=3, expand_animations=False)
@@ -83,6 +81,12 @@ def make_dataset(image_paths, boxes, classes, batch_size, shuffle, height, width
         return img, targets
 
     ds = ds.map(read_image, num_parallel_calls=tf.data.AUTOTUNE)
+    if cache_path is not None:
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        ds = ds.cache(cache_path)  # cache decoded/resized images so only epoch 1 pays disk+decode cost
+    if shuffle:
+        # shuffle after cache so each epoch gets a fresh permutation instead of replaying epoch 1's order
+        ds = ds.shuffle(buffer_size=len(image_paths))
     return ds.ragged_batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 
@@ -147,6 +151,10 @@ def main():
                          help="Epochs with no val_loss improvement before ReduceLROnPlateau halves the lr")
     parser.add_argument("--output", default="models/efficientnet_tf_efficientnet_b0_detect_best.keras")
     parser.add_argument("--log-dir", default="logs", help="Directory for this run's log file")
+    parser.add_argument("--cache-dir", default="cache/detect_ds",
+                         help="Directory to disk-cache decoded/resized images so only epoch 1 pays "
+                              "disk+decode cost. Delete this dir if the dataset or --height/--width change. "
+                              "Pass '' to disable caching.")
     args = parser.parse_args()
 
     emit, log_path = make_emitter(args.log_dir)
@@ -168,8 +176,11 @@ def main():
     val_images, val_boxes, val_classes = load_split(data_root / "val", args.height, args.width)
     emit(f"Train: {len(train_images)} images  Val: {len(val_images)} images")
 
-    train_ds = make_dataset(train_images, train_boxes, train_classes, args.batch_size, shuffle=True, height=args.height, width=args.width)
-    val_ds = make_dataset(val_images, val_boxes, val_classes, args.batch_size, shuffle=False, height=args.height, width=args.width)
+    cache_dir = Path(args.cache_dir) if args.cache_dir else None
+    train_cache = str(cache_dir / f"train_{args.height}x{args.width}") if cache_dir else None
+    val_cache = str(cache_dir / f"val_{args.height}x{args.width}") if cache_dir else None
+    train_ds = make_dataset(train_images, train_boxes, train_classes, args.batch_size, shuffle=True, height=args.height, width=args.width, cache_path=train_cache)
+    val_ds = make_dataset(val_images, val_boxes, val_classes, args.batch_size, shuffle=False, height=args.height, width=args.width, cache_path=val_cache)
 
     model = build_model(num_classes, args.height, args.width)
     steps_per_epoch = max(len(train_images) // args.batch_size, 1)
