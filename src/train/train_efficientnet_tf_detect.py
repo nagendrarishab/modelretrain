@@ -85,9 +85,30 @@ def make_dataset(image_paths, boxes, classes, batch_size, shuffle, height, width
         Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
         ds = ds.cache(cache_path)  # cache decoded/resized images so only epoch 1 pays disk+decode cost
     if shuffle:
-        # shuffle after cache so each epoch gets a fresh permutation instead of replaying epoch 1's order
-        ds = ds.shuffle(buffer_size=len(image_paths))
+        # shuffle after cache so each epoch gets a fresh permutation instead of replaying epoch 1's order.
+        # Buffer holds decoded images (not cheap path strings) here, so cap it well below the full
+        # dataset size - a full-size buffer would try to hold ~17GB of images in RAM at once, and a
+        # partial/warmup read of the dataset (e.g. Keras building the model on one batch) would force
+        # a full buffer fill without ever reaching a clean end-of-sequence, causing the cache write to
+        # be discarded every time (the "did not fully read the dataset being cached" warning).
+        ds = ds.shuffle(buffer_size=min(len(image_paths), 2048))
     return ds.ragged_batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+
+def resolve_cache_path(cache_path, emit):
+    """Claims cache_path for this process to build, or returns None to skip caching this
+    run if another process is already building it (train_resnet_tf_detect.py shares the
+    same cache dir/filenames since it decodes the same images at the same size)."""
+    if Path(f"{cache_path}.index").exists():
+        return cache_path  # already fully built - safe for any number of concurrent readers
+    lock_path = Path(f"{cache_path}.lock")
+    try:
+        lock_path.touch(exist_ok=False)
+    except FileExistsError:
+        emit(f"Cache at {cache_path} is being built by another run - skipping caching for this run "
+             f"(delete {lock_path} if that run crashed without finishing)")
+        return None
+    return cache_path
 
 
 class WarmupCallback(keras.callbacks.Callback):
@@ -177,8 +198,12 @@ def main():
     emit(f"Train: {len(train_images)} images  Val: {len(val_images)} images")
 
     cache_dir = Path(args.cache_dir) if args.cache_dir else None
-    train_cache = str(cache_dir / f"train_{args.height}x{args.width}") if cache_dir else None
-    val_cache = str(cache_dir / f"val_{args.height}x{args.width}") if cache_dir else None
+    if cache_dir:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        train_cache = resolve_cache_path(str(cache_dir / f"train_{args.height}x{args.width}"), emit)
+        val_cache = resolve_cache_path(str(cache_dir / f"val_{args.height}x{args.width}"), emit)
+    else:
+        train_cache = val_cache = None
     train_ds = make_dataset(train_images, train_boxes, train_classes, args.batch_size, shuffle=True, height=args.height, width=args.width, cache_path=train_cache)
     val_ds = make_dataset(val_images, val_boxes, val_classes, args.batch_size, shuffle=False, height=args.height, width=args.width, cache_path=val_cache)
 
