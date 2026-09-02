@@ -16,6 +16,8 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
 BACKBONE_CHOICES = ["densenet_121_imagenet", "densenet_169_imagenet", "densenet_201_imagenet"]
 
+MODEL_FAMILY = "densenet"  # cache namespace when --isolate-cache is passed - see its --help text
+
 
 def log_device(emit):
     """Reports which device TF will place ops on. Unlike torch's get_device()/.to(device)
@@ -112,8 +114,9 @@ def make_dataset(image_paths, boxes, classes, batch_size, shuffle, height, width
 
 def resolve_cache_path(cache_path, emit):
     """Claims cache_path for this process to build, or returns None to skip caching this
-    run if another process is already building it (the other train_*_tf_detect.py scripts
-    share the same cache dir/filenames since they decode the same images at the same size)."""
+    run if another process is already building it (by default, the other train_*_tf_detect.py
+    scripts share the same cache dir/filenames since they decode the same images at the same
+    size - pass --isolate-cache to use a namespaced path instead)."""
     if Path(f"{cache_path}.index").exists():
         return cache_path  # already fully built - safe for any number of concurrent readers
     lock_path = Path(f"{cache_path}.lock")
@@ -195,7 +198,16 @@ def main():
     parser.add_argument("--cache-dir", default="cache/detect_ds",
                          help="Directory to disk-cache decoded/resized images so only epoch 1 pays "
                               "disk+decode cost. Delete this dir if the dataset or --height/--width change. "
-                              "Pass '' to disable caching.")
+                              "Pass '' to disable caching. By default this is shared with the other "
+                              "train_*_tf_detect.py scripts whenever --height/--width match, since the "
+                              "cache only holds decoded/resized images - identical regardless of backbone. "
+                              "See --isolate-cache to opt out of that sharing.")
+    parser.add_argument("--isolate-cache", action="store_true",
+                         help=f"Namespace this run's cache files under '{MODEL_FAMILY}' instead of sharing "
+                              "them with the other train_*_tf_detect.py scripts. Useful to avoid lock "
+                              "contention between concurrent runs, or to keep a model family's cache "
+                              "independently deletable/rebuildable. Costs extra disk - the cached data "
+                              "is otherwise identical across scripts at the same --height/--width.")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu"],
                          help="'cpu' forces CPU-only training (e.g. to compare against a GPU run, or "
                               "work around a GPU-specific issue) by hiding any GPU from TF - same "
@@ -234,8 +246,9 @@ def main():
     cache_dir = Path(args.cache_dir) if args.cache_dir else None
     if cache_dir:
         cache_dir.mkdir(parents=True, exist_ok=True)
-        train_cache = resolve_cache_path(str(cache_dir / f"train_{args.height}x{args.width}"), emit)
-        val_cache = resolve_cache_path(str(cache_dir / f"val_{args.height}x{args.width}"), emit)
+        cache_prefix = f"{MODEL_FAMILY}_" if args.isolate_cache else ""
+        train_cache = resolve_cache_path(str(cache_dir / f"{cache_prefix}train_{args.height}x{args.width}"), emit)
+        val_cache = resolve_cache_path(str(cache_dir / f"{cache_prefix}val_{args.height}x{args.width}"), emit)
     else:
         train_cache = val_cache = None
     train_ds = make_dataset(train_images, train_boxes, train_classes, args.batch_size, shuffle=True, height=args.height, width=args.width, cache_path=train_cache)
