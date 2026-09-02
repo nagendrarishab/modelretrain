@@ -1,5 +1,12 @@
 """
     python src/train/train_resnet_fasterrcnn_detect.py --epochs 30
+
+    # GPU/MPS run (default) - only one process gets the GPU at a time, so use the largest
+    # --batch-size that fits instead of splitting it across concurrent GPU runs:
+    ./.venv/bin/python src/train/train_resnet_fasterrcnn_detect.py --epochs 2 --batch-size 16
+
+    # CPU run - pair with a GPU run of another backbone for real parallelism (see --device):
+    ./.venv/bin/python src/train/train_resnet_fasterrcnn_detect.py --epochs 2 --batch-size 4 --device cpu
 """
 import argparse
 import os
@@ -10,6 +17,7 @@ import certifi
 
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 
+import numpy as np
 import torch
 import yaml
 from PIL import Image
@@ -42,14 +50,33 @@ def make_emitter(log_dir):
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
 
 class YoloFormatDataset(Dataset):
+    """--cache mirrors train_yolo_detect.py's --cache and the train_*_torch_detect.py
+    RetinaNet ports' --cache: avoids re-decoding the same JPEG every epoch. Unlike those
+    RetinaNet ports, Faster R-CNN's own GeneralizedRCNNTransform resizes internally (no
+    fixed height/width here), so what's cached is the image at its native decoded
+    resolution. 'disk' writes it once to a <stem>.npy file under --cache-dir (survives
+    across runs, and across --workers > 0's separate worker processes, since they share
+    the filesystem - writes go through a temp file + atomic rename so concurrent workers
+    racing to cache the same image can't corrupt it). 'ram' keeps a dict in this process
+    only - with --workers > 0 each worker process gets its own private dict, and shuffled
+    sampling means a given worker rarely sees the same image twice, so it's a much weaker
+    cache here than in the (worker-less) RetinaNet ports; 'disk' is the one that matters.
+    'none' decodes fresh every access."""
 
-    def __init__(self, split_dir):
+    def __init__(self, split_dir, cache="disk", cache_dir=None):
         self.images_dir = split_dir / "images"
         self.labels_dir = split_dir / "labels"
+        self.cache = cache
+        self.cache_dir = Path(cache_dir) / split_dir.name if cache_dir else None
+        if self.cache == "disk":
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.ram_cache = {} if cache == "ram" else None
         self.image_paths = sorted(
             p for p in self.images_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS
         )
@@ -57,10 +84,33 @@ class YoloFormatDataset(Dataset):
     def __len__(self):
         return len(self.image_paths)
 
+    def _load_image_array(self, image_path):
+        if self.ram_cache is not None and image_path in self.ram_cache:
+            return self.ram_cache[image_path]
+
+        npy_path = None
+        if self.cache == "disk":
+            npy_path = self.cache_dir / f"{image_path.stem}.npy"
+            if npy_path.exists():
+                arr = np.load(npy_path)
+                if self.ram_cache is not None:
+                    self.ram_cache[image_path] = arr
+                return arr
+
+        arr = np.array(Image.open(image_path).convert("RGB"))  # np.array (not np.asarray) copies -> writable
+
+        if npy_path is not None:
+            tmp_path = npy_path.with_suffix(f".tmp-{os.getpid()}.npy")
+            np.save(tmp_path, arr)
+            os.replace(tmp_path, npy_path)  # atomic - safe if another --workers process races us here
+        if self.ram_cache is not None:
+            self.ram_cache[image_path] = arr
+        return arr
+
     def __getitem__(self, idx):
         image_path = self.image_paths[idx]
-        img = Image.open(image_path).convert("RGB")
-        width, height = img.size
+        arr = self._load_image_array(image_path)
+        height, width = arr.shape[:2]
 
         boxes, labels = [], []
         label_path = self.labels_dir / f"{image_path.stem}.txt"
@@ -81,7 +131,7 @@ class YoloFormatDataset(Dataset):
             "labels": torch.tensor(labels, dtype=torch.int64),
             "image_id": torch.tensor([idx]),
         }
-        return to_tensor(img), target
+        return to_tensor(arr), target
 
 
 def collate_fn(batch):
@@ -133,6 +183,21 @@ def main():
     parser.add_argument("--workers", type=int, default=4, help="DataLoader worker processes")
     parser.add_argument("--output", default="models/resnet_fasterrcnn_detect_best.pt")
     parser.add_argument("--log-dir", default="logs", help="Directory for this run's log file")
+    parser.add_argument("--cache", default="disk", choices=["disk", "ram", "none"],
+                         help="cache decoded images to avoid re-reading+re-decoding the same JPEG every "
+                              "epoch (same idea as train_yolo_detect.py's --cache). 'disk' (default) writes "
+                              "each image once under --cache-dir and reuses it on later epochs *and* later "
+                              "runs. 'ram' skips the disk write but only lasts this process. 'none' decodes "
+                              "fresh every access.")
+    parser.add_argument("--cache-dir", default="cache/detect_ds_fasterrcnn_torch",
+                         help="Directory for --cache disk files. Shared by default with the other "
+                              "train_*_fasterrcnn_detect.py scripts, since the cached array is just the "
+                              "decoded image at native resolution - identical regardless of backbone. "
+                              "Delete it if the dataset changes.")
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu"],
+                         help="'cpu' forces CPU-only training (e.g. to run alongside another script's "
+                              "GPU/MPS run, or work around a GPU-specific issue). 'auto' (default) trains "
+                              "on GPU if one is visible (CUDA, or Apple Silicon via MPS), else CPU")
     args = parser.parse_args()
 
     emit, log_path = make_emitter(args.log_dir)
@@ -148,7 +213,7 @@ def main():
     class_names = yaml.safe_load(data_yaml_path.read_text())["names"]
     num_classes = len(class_names) + 1  # +1 for background
 
-    device = get_device()
+    device = torch.device("cpu") if args.device == "cpu" else get_device()
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
     emit(f"Using device: {device}")
@@ -159,16 +224,17 @@ def main():
         pin_memory=device.type == "cuda",
         persistent_workers=args.workers > 0,
     )
+    dataset_kwargs = dict(cache=args.cache, cache_dir=args.cache_dir if args.cache == "disk" else None)
     train_loader = DataLoader(
-        YoloFormatDataset(data_root / "train"), batch_size=args.batch_size,
+        YoloFormatDataset(data_root / "train", **dataset_kwargs), batch_size=args.batch_size,
         shuffle=True, **loader_kwargs,
     )
     val_loader = DataLoader(
-        YoloFormatDataset(data_root / "val"), batch_size=args.batch_size,
+        YoloFormatDataset(data_root / "val", **dataset_kwargs), batch_size=args.batch_size,
         shuffle=False, **loader_kwargs,
     )
     test_loader = DataLoader(
-        YoloFormatDataset(data_root / "test"), batch_size=args.batch_size,
+        YoloFormatDataset(data_root / "test", **dataset_kwargs), batch_size=args.batch_size,
         shuffle=False, **loader_kwargs,
     )
     emit(f"Train: {len(train_loader.dataset)} images ({len(train_loader)} batches/epoch)  "
@@ -220,6 +286,10 @@ def main():
             progress.set_postfix(loss=f"{loss.item():.4f}")
 
         scheduler.step()
+        if device.type == "mps":
+            # MPS's caching allocator doesn't release memory between epochs the way CUDA's
+            # does, so long runs slowly accumulate until the OS OOM-kills the process
+            torch.mps.empty_cache()
         map50, map5095 = evaluate(model, val_loader, device)
         emit(f"Epoch {epoch}/{args.epochs}  loss={epoch_loss / len(train_loader):.4f}  "
              f"val mAP50={map50:.4f}  val mAP50-95={map5095:.4f}")
