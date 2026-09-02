@@ -1,6 +1,12 @@
 """
     python src/train/train_densenet_tf_detect.py --backbone densenet_121_imagenet --epochs 30
+
+    # GPU run (default) - only one process gets the shared Metal GPU at a time, so use the
+    # largest --batch-size that fits instead of splitting it across concurrent GPU runs:
     ./.venv/bin/python src/train/train_densenet_tf_detect.py --epochs 2 --batch-size 16
+
+    # CPU run - pair with a GPU run of another backbone for real parallelism (see --device):
+    ./.venv/bin/python src/train/train_densenet_tf_detect.py --epochs 2 --batch-size 4 --device cpu
 """
 import argparse
 from datetime import datetime

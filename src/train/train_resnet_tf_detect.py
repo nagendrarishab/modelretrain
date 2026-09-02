@@ -1,7 +1,12 @@
 """
     python src/train/train_resnet_tf_detect.py --epochs 30
-./.venv/bin/python src/train/train_resnet_tf_detect.py --epochs 2 --batch-size 16
 
+    # GPU run (default) - only one process gets the shared Metal GPU at a time, so use the
+    # largest --batch-size that fits instead of splitting it across concurrent GPU runs:
+    ./.venv/bin/python src/train/train_resnet_tf_detect.py --epochs 2 --batch-size 16
+
+    # CPU run - pair with a GPU run of another backbone for real parallelism (see --device):
+    ./.venv/bin/python src/train/train_resnet_tf_detect.py --epochs 2 --batch-size 4 --device cpu
 """
 import argparse
 from datetime import datetime
@@ -14,6 +19,19 @@ import tensorflow as tf
 import yaml
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
+
+
+def log_device(emit):
+    """Reports which device TF will place ops on. Unlike torch's get_device()/.to(device)
+    pattern used in the other train_*.py scripts, TF auto-places ops on whatever GPU is
+    visible - a CUDA GPU on Linux, or Apple Silicon's GPU via the tensorflow-metal plugin -
+    both surfacing as device_type "GPU", so there's nothing to select or move tensors to."""
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus:
+        names = ", ".join(gpu.name for gpu in gpus)
+        emit(f"Using GPU: {names}")
+    else:
+        emit("No GPU found - training on CPU")
 
 
 def make_emitter(log_dir):
@@ -175,10 +193,19 @@ def main():
                          help="Directory to disk-cache decoded/resized images so only epoch 1 pays "
                               "disk+decode cost. Delete this dir if the dataset or --height/--width change. "
                               "Pass '' to disable caching.")
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu"],
+                         help="'cpu' forces CPU-only training (e.g. to run alongside another script's "
+                              "GPU run, or work around a GPU-specific issue) by hiding any GPU from TF. "
+                              "'auto' (default) trains on GPU if one is visible (CUDA, or Apple Silicon "
+                              "via tensorflow-metal), else CPU")
     args = parser.parse_args()
+
+    if args.device == "cpu":
+        tf.config.set_visible_devices([], "GPU")  # must run before TF touches any GPU op
 
     emit, log_path = make_emitter(args.log_dir)
     emit(f"Logging to {log_path}")
+    log_device(emit)
 
     data_yaml_path = Path(args.data)
     if not data_yaml_path.exists():

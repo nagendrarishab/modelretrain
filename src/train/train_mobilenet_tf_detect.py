@@ -1,6 +1,12 @@
 """
     python src/train/train_mobilenet_tf_detect.py --backbone mobilenet_v3_large_100_imagenet --epochs 30
-    ./.venv/bin/python src/train/train_mobilenet_tf_detect.py --epochs 2 --batch-size 16
+
+    # CPU run (default - matches this script's previous unconditional behavior):
+    ./.venv/bin/python src/train/train_mobilenet_tf_detect.py --epochs 2 --batch-size 4
+
+    # GPU run - pass --device auto to use the shared Metal GPU instead, with a larger batch size
+    # (only one process gets the GPU at a time, so this is the run to size up if it's the one on GPU):
+    ./.venv/bin/python src/train/train_mobilenet_tf_detect.py --epochs 2 --batch-size 16 --device auto
 """
 import argparse
 from datetime import datetime
@@ -12,11 +18,22 @@ import numpy as np
 import tensorflow as tf
 import yaml
 
-tf.config.set_visible_devices([], "GPU")
-
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
 BACKBONE_CHOICES = ["mobilenet_v3_large_100_imagenet", "mobilenet_v3_large_100_imagenet_21k"]
+
+
+def log_device(emit):
+    """Reports which device TF will place ops on. Unlike torch's get_device()/.to(device)
+    pattern used in the other train_*.py scripts, TF auto-places ops on whatever GPU is
+    visible - a CUDA GPU on Linux, or Apple Silicon's GPU via the tensorflow-metal plugin -
+    both surfacing as device_type "GPU", so there's nothing to select or move tensors to."""
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus:
+        names = ", ".join(gpu.name for gpu in gpus)
+        emit(f"Using GPU: {names}")
+    else:
+        emit("No GPU found - training on CPU")
 
 
 def make_emitter(log_dir):
@@ -230,10 +247,21 @@ def main():
                          help="Directory to disk-cache decoded/resized images so only epoch 1 pays "
                               "disk+decode cost. Delete this dir if the dataset or --height/--width change. "
                               "Pass '' to disable caching.")
+    parser.add_argument("--device", default="cpu", choices=["auto", "cpu"],
+                         help="'cpu' (default) forces CPU-only training by hiding any GPU from TF - "
+                              "this script's original unconditional behavior, kept as the default here "
+                              "since this custom pyramid MobileNet backbone hasn't been validated on GPU. "
+                              "'auto' trains on GPU if one is visible (CUDA, or Apple Silicon via "
+                              "tensorflow-metal), else CPU - pass it to try GPU, e.g. as the one script "
+                              "running on GPU while others run on CPU")
     args = parser.parse_args()
+
+    if args.device == "cpu":
+        tf.config.set_visible_devices([], "GPU")  # must run before TF touches any GPU op
 
     emit, log_path = make_emitter(args.log_dir)
     emit(f"Logging to {log_path}")
+    log_device(emit)
 
     data_yaml_path = Path(args.data)
     if not data_yaml_path.exists():
