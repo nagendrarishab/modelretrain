@@ -22,3 +22,5 @@ raw_labels/
 data_pose/
 testcase/
 cache/
+venv/
+models/

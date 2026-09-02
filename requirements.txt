@@ -3,7 +3,10 @@ torchvision
 timm
 torchmetrics
 pycocotools
-tensorflow
+# pinned together - on Apple Silicon, `tensorflow`/`pyarrow` versions newer than these hang
+# (mutex deadlock) partway through `import keras_hub`, and tensorflow-metal (installed
+# separately, not in this file) lags behind the newest `tensorflow` releases
+tensorflow==2.19.0
 keras-hub
 tqdm
 ultralytics
@@ -14,3 +17,5 @@ certifi
 python-dotenv
 google-genai
 httpx
+# pyarrow==17.0.0
+tensorflow-metal
