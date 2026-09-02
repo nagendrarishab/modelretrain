@@ -194,7 +194,7 @@ def main():
                               "train_*_fasterrcnn_detect.py scripts, since the cached array is just the "
                               "decoded image at native resolution - identical regardless of backbone. "
                               "Delete it if the dataset changes.")
-    parser.add_argument("--device", default="auto", choices=["auto", "cpu"],
+    parser.add_argument("--device", default="cpu", choices=["auto", "cpu"],
                          help="'cpu' forces CPU-only training (e.g. to run alongside another script's "
                               "GPU/MPS run, or work around a GPU-specific issue). 'auto' (default) trains "
                               "on GPU if one is visible (CUDA, or Apple Silicon via MPS), else CPU")
