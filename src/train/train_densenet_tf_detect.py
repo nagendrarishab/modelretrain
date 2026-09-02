@@ -17,6 +17,19 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 BACKBONE_CHOICES = ["densenet_121_imagenet", "densenet_169_imagenet", "densenet_201_imagenet"]
 
 
+def log_device(emit):
+    """Reports which device TF will place ops on. Unlike torch's get_device()/.to(device)
+    pattern used in the other train_*.py scripts, TF auto-places ops on whatever GPU is
+    visible - a CUDA GPU on Linux, or Apple Silicon's GPU via the tensorflow-metal plugin -
+    both surfacing as device_type "GPU", so there's nothing to select or move tensors to."""
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus:
+        names = ", ".join(gpu.name for gpu in gpus)
+        emit(f"Using GPU: {names}")
+    else:
+        emit("No GPU found - training on CPU")
+
+
 def make_emitter(log_dir):
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     log_path = Path(log_dir) / f"train_densenet_tf_{datetime.now():%Y%m%d_%H%M%S}.log"
@@ -183,7 +196,16 @@ def main():
                          help="Directory to disk-cache decoded/resized images so only epoch 1 pays "
                               "disk+decode cost. Delete this dir if the dataset or --height/--width change. "
                               "Pass '' to disable caching.")
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu"],
+                         help="'cpu' forces CPU-only training (e.g. to compare against a GPU run, or "
+                              "work around a GPU-specific issue) by hiding any GPU from TF - same "
+                              "mechanism train_mobilenet_tf_detect.py uses unconditionally. 'auto' "
+                              "(default) trains on GPU if one is visible (CUDA, or Apple Silicon via "
+                              "tensorflow-metal), else CPU")
     args = parser.parse_args()
+
+    if args.device == "cpu":
+        tf.config.set_visible_devices([], "GPU")  # must run before TF touches any GPU op
 
     if args.output is None:
         depth = args.backbone.split("_")[1]  # "densenet_121_imagenet" -> "121"
@@ -191,6 +213,7 @@ def main():
 
     emit, log_path = make_emitter(args.log_dir)
     emit(f"Logging to {log_path}")
+    log_device(emit)
 
     data_yaml_path = Path(args.data)
     if not data_yaml_path.exists():
