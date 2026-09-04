@@ -1,7 +1,12 @@
 """
-    python src/run/run_camera_mobilenetv3_fasterrcnn_detect.py --model-path models/mobilenetv3_detect_best.pt --source webcam
-    python src/run/run_camera_mobilenetv3_fasterrcnn_detect.py --model-path models/mobilenetv3_detect_best.pt --source droidcam \
+    python src/run/run_camera_densenet_torch_detect.py --model-path models/densenet_torch_densenet121_detect_best.pt --source webcam
+    python src/run/run_camera_densenet_torch_detect.py --model-path models/densenet_torch_densenet121_detect_best.pt --source droidcam \
         --droidcam-ip 192.168.0.107 --droidcam-port 4747
+
+PyTorch counterpart of run_camera_densenet_tf_detect.py, for checkpoints produced by
+train_densenet_torch_detect.py (torchvision DenseNet + a 3-level FPN, wrapped in
+torchvision's own RetinaNet - see that file's DenseNetFPNBackbone/build_model for the
+architecture).
 """
 import argparse
 import logging
@@ -16,10 +21,17 @@ os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 
 import cv2
 import torch
-from torchvision.models.detection import fasterrcnn_mobilenet_v3_large_fpn, fasterrcnn_mobilenet_v3_large_320_fpn
+from torch import nn
+from torchvision.models import densenet121, densenet169, densenet201
+from torchvision.models.detection.anchor_utils import AnchorGenerator
+from torchvision.models.detection.retinanet import RetinaNet
+from torchvision.models.feature_extraction import create_feature_extractor
+from torchvision.ops import FeaturePyramidNetwork
 from torchvision.transforms.functional import to_tensor
 
-logger = logging.getLogger("camera_mobilenetv3_fasterrcnn_detect")
+logger = logging.getLogger("camera_densenet_torch_detect")
+
+BACKBONE_CTORS = {"densenet121": densenet121, "densenet169": densenet169, "densenet201": densenet201}
 
 
 def setup_logging(log_dir):
@@ -44,8 +56,6 @@ def setup_logging(log_dir):
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
-    # MPS is eval-only here - the training script defaults to CPU because of an
-    # MPS backward-pass bug, but inference (this script) never calls backward().
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
@@ -54,21 +64,44 @@ def get_device():
 LABEL_COLORS = {"open": (0, 200, 0), "closed": (0, 0, 220)}  # BGR
 
 
-def build_model(num_classes, variant):
-    ctor = fasterrcnn_mobilenet_v3_large_320_fpn if variant == "large_320_fpn" else fasterrcnn_mobilenet_v3_large_fpn
-    # weights_backbone=None here too - real weights come from the
-    # checkpoint's state_dict a moment later, not from a fresh download.
-    return ctor(weights=None, weights_backbone=None, num_classes=num_classes)
+class DenseNetFPNBackbone(nn.Module):
+    """Must match train_densenet_torch_detect.py's DenseNetFPNBackbone exactly - same
+    denseblock2/denseblock3/norm5 -> p3/p4/p5 feature extraction feeding a plain 3-level FPN."""
+
+    def __init__(self, densenet, height, width, out_channels=256):
+        super().__init__()
+        self.body = create_feature_extractor(
+            densenet, return_nodes={
+                "features.denseblock2": "p3", "features.denseblock3": "p4", "features.norm5": "p5",
+            },
+        )
+        with torch.no_grad():
+            dummy = self.body(torch.zeros(1, 3, height, width))
+        in_channels_list = [dummy[k].shape[1] for k in ("p3", "p4", "p5")]
+        self.fpn = FeaturePyramidNetwork(in_channels_list, out_channels, extra_blocks=None)
+        self.out_channels = out_channels
+
+    def forward(self, x):
+        return self.fpn(self.body(x))
+
+
+def build_model(num_classes, height, width, backbone_name):
+    backbone = DenseNetFPNBackbone(BACKBONE_CTORS[backbone_name](weights=None), height, width)
+    anchor_sizes = tuple((s, int(s * 2 ** (1.0 / 3)), int(s * 2 ** (2.0 / 3))) for s in (32, 64, 128))
+    aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_sizes)
+    anchor_generator = AnchorGenerator(anchor_sizes, aspect_ratios)
+    return RetinaNet(backbone, num_classes, min_size=height, max_size=width, anchor_generator=anchor_generator)
 
 
 def load_model(model_path, device):
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     class_names = checkpoint["class_names"]
+    height, width = checkpoint["height"], checkpoint["width"]
 
-    model = build_model(len(class_names) + 1, checkpoint["variant"])
+    model = build_model(len(class_names), height, width, checkpoint["backbone"])
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device).eval()
-    return model, class_names
+    return model, class_names, height, width
 
 
 def open_capture(args):
@@ -87,16 +120,21 @@ def open_capture(args):
 
 
 @torch.no_grad()
-def detect(model, class_names, frame, device, conf_threshold):
-    img_tensor = to_tensor(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).to(device)
+def detect(model, class_names, frame, device, conf_threshold, height, width):
+    orig_height, orig_width = frame.shape[:2]
+    resized = cv2.resize(frame, (width, height))
+    img_tensor = to_tensor(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)).to(device)
     prediction = model([img_tensor])[0]
 
+    x_scale, y_scale = orig_width / width, orig_height / height
     detections = []
     for box, label, score in zip(prediction["boxes"], prediction["labels"], prediction["scores"]):
         if score < conf_threshold:
             continue
-        x1, y1, x2, y2 = map(int, box.tolist())
-        class_name = class_names[int(label.item()) - 1]  # label 0 is background
+        x1, y1, x2, y2 = box.tolist()
+        x1, x2 = int(x1 * x_scale), int(x2 * x_scale)
+        y1, y2 = int(y1 * y_scale), int(y2 * y_scale)
+        class_name = class_names[int(label.item())]  # 0-indexed, RetinaNet has no background class
         detections.append((x1, y1, x2, y2, class_name, float(score)))
     return detections
 
@@ -119,8 +157,8 @@ def log_detections(detections):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", default="models/mobilenetv3_detect_best.pt")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--model-path", default="models/densenet_torch_densenet121_detect_best.pt")
     parser.add_argument("--conf", type=float, default=0.5,
                          help="minimum confidence to consider the box 'visible' and draw anything")
     parser.add_argument("--source", choices=["webcam", "droidcam"], default="webcam")
@@ -143,11 +181,12 @@ def main():
 
     device = get_device()
     logger.info(f"Using device: {device}")
-    model, class_names = load_model(args.model_path, device)
-    logger.info(f"Loaded model, classes: {class_names}, confidence threshold: {args.conf:.0%}")
+    model, class_names, height, width = load_model(args.model_path, device)
+    logger.info(f"Loaded model, classes: {class_names}, input size: {height}x{width}, "
+                f"confidence threshold: {args.conf:.0%}")
 
     cap = open_capture(args)
-    window = "Box Detector - MobileNetV3 Faster R-CNN (q to quit)"
+    window = "Box Detector - DenseNet RetinaNet Torch (q to quit)"
     last_log_time = 0.0
 
     try:
@@ -160,7 +199,7 @@ def main():
                 cap = open_capture(args)
                 continue
 
-            detections = detect(model, class_names, frame, device, args.conf)
+            detections = detect(model, class_names, frame, device, args.conf, height, width)
             draw_detections(frame, detections)
 
             now = time.monotonic()

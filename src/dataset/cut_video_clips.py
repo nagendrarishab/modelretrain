@@ -64,11 +64,16 @@ def cut_clips(input_path, segments, out_dir, concat):
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
 
-    for start, end in segments:
-        if start > duration or end > duration:
-            print(f"Warning: segment {start:.1f}-{end:.1f}s exceeds video duration ({duration:.1f}s)")
+    # Some containers (e.g. continuous camera recordings) don't carry a reliable
+    # frame count, so cv2 reports a bogus value like 0 or 1. Skip the sanity
+    # check rather than warn against a duration we don't actually know.
+    if frame_count > 1:
+        duration = frame_count / fps
+        for start, end in segments:
+            if start > duration or end > duration:
+                print(f"Warning: segment {start:.1f}-{end:.1f}s exceeds video duration ({duration:.1f}s)")
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

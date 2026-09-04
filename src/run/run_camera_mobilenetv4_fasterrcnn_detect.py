@@ -52,6 +52,10 @@ def setup_logging(log_dir):
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
+    # MPS is eval-only here - the training script defaults to CPU because of an
+    # MPS backward-pass bug, but inference (this script) never calls backward().
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
 
