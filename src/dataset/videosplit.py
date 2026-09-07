@@ -10,7 +10,7 @@ import cv2
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--video-path", nargs="+", default=["data_vid.mp4"], help="one or more video files")
-parser.add_argument("--output-dir", default=".", help="where to save extracted <video_name>_frame_NNNNN.jpg files")
+parser.add_argument("--output-dir", default="data", help="where to save extracted <video_name>_frame_NNNNN.jpg files")
 
 mode_group = parser.add_mutually_exclusive_group()
 mode_group.add_argument("--target-fps", type=int, help="extract ~N frames per second of video")

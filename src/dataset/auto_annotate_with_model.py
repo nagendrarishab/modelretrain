@@ -1,13 +1,14 @@
 """
 python src/dataset/auto_annotate_with_model.py \
     --images-dir testcase/test/images --labels-dir testcase/test/labels \
-    --model-path yolo26n_best.pt --data testcase/data.yaml
+    --model-path yolo26n_best.pt
 
-Controls: same as auto_annotate_bboxes.py - drag to add a box, right-click a box
-to toggle its class, o/c to set the class new boxes get, y/n/Enter to save+advance,
-e to confirm this image has no box (saves an empty label - only when no boxes are
-drawn), r to undo last box, s to skip, b to go back, q/Esc to quit (progress
-already saved is kept).
+Controls: same as auto_annotate_bboxes.py - click a box's 4 corners to add it,
+right-click a box to toggle its class, o/c to set the class new boxes get,
+y/n/Enter to save+advance, e to confirm this image has no box (saves an empty
+label - only when no boxes are drawn), r to undo the last placed corner (or
+last box, if none are pending), s to skip, b to go back, q/Esc to quit
+(progress already saved is kept).
 """
 import argparse
 import sys
@@ -35,7 +36,6 @@ def main():
     parser.add_argument("--model-path", required=True,
                          help="trained checkpoint used to suggest boxes+classes - any format "
                               "evaluate_models.py's identify_and_load() recognizes")
-    parser.add_argument("--data", default="testcase/data.yaml")
     parser.add_argument("--conf", type=float, default=0.25,
                          help="lower than evaluate_models.py's eval default so borderline "
                               "boxes are still suggested for a human to confirm/reject")
@@ -45,7 +45,7 @@ def main():
                               "filename, the last one you finished last run")
     args = parser.parse_args()
 
-    _, class_names, predictor = identify_and_load(args.model_path, args.conf, args.data)
+    _, class_names, predictor = identify_and_load(args.model_path, args.conf)
     name_to_idx = {name: i for i, name in enumerate(class_names)}
 
     images_dir = Path(args.images_dir)
@@ -74,8 +74,8 @@ def main():
         print("Nothing to do.")
         return
 
-    window = "Auto-annotate with model (drag=add box, right-click=toggle class, " \
-             "n/y/Enter=save+next, e=confirm empty, r=undo last box, s=skip, b=back, q=quit)"
+    window = "Auto-annotate with model (click 4 corners=add box, right-click=toggle class, " \
+             "n/y/Enter=save+next, e=confirm empty, r=undo last, s=skip, b=back, q=quit)"
     cv2.namedWindow(window)
 
     idx = 0
