@@ -546,6 +546,9 @@ def main():
                          help="DFL: number of distance bins per side is reg_max+1")
     parser.add_argument("--ema-decay", type=float, default=EMA_DECAY,
                          help="exponential moving average decay for eval/checkpoint weights")
+    parser.add_argument("--patience", type=int, default=0,
+                         help="stop training if val mAP50 doesn't improve for this many epochs "
+                              "in a row (0 = disabled, train the full --epochs)")
     parser.add_argument("--output", default="models/nanodet_torch_best.pt")
     parser.add_argument("--log-dir", default="logs", help="Directory for this run's log file")
     parser.add_argument("--cache", default="disk", choices=["disk", "ram", "none"],
@@ -606,6 +609,7 @@ def main():
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     best_map50 = -1.0
+    epochs_without_improvement = 0
 
     for epoch in range(1, args.epochs + 1):
         for group in optimizer.param_groups:
@@ -650,6 +654,7 @@ def main():
 
         if map50 > best_map50:
             best_map50 = map50
+            epochs_without_improvement = 0
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "family": "nanodet-torch",
@@ -657,7 +662,14 @@ def main():
                 "img_size": args.img_size,
                 "reg_max": args.reg_max,
             }, output_path)
+        else:
+            epochs_without_improvement += 1
         ema.swap_out(model.parameters())
+
+        if args.patience > 0 and epochs_without_improvement >= args.patience:
+            emit(f"Early stopping: val mAP50 hasn't improved for {epochs_without_improvement} epochs "
+                 f"(--patience={args.patience})")
+            break
 
     emit(f"\nSaved best model to {output_path} (val mAP50={best_map50:.4f})")
     emit(f"Class names ({num_classes}): {class_names}")
