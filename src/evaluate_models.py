@@ -177,16 +177,22 @@ def load_ground_truth(label_path, img_w, img_h, class_names):
     return gts
 
 
-def match_image(preds, gts, name_to_idx, iou_thres, matrix):
+def match_image(preds, gts, name_to_idx, iou_thres, matrix, image_name, mistakes):
+    """Same TP/FP/FN accounting as before, plus appends one entry to `mistakes` per
+    false positive ('fp', predicted class, image_name) or false negative
+    ('fn', ground-truth class, image_name) so the caller can report which specific
+    image files each model got wrong (see --dump-mistakes)."""
     nc = len(name_to_idx)
 
     if not gts:
         for pred in preds:
             matrix[name_to_idx[pred[4]], nc] += 1
+            mistakes.append(("fp", pred[4], image_name))
         return
     if not preds:
         for gt in gts:
             matrix[nc, name_to_idx[gt[4]]] += 1
+            mistakes.append(("fn", gt[4], image_name))
         return
 
     gt_boxes = torch.tensor([g[:4] for g in gts], dtype=torch.float32)
@@ -210,12 +216,17 @@ def match_image(preds, gts, name_to_idx, iou_thres, matrix):
         if gi in matched_gt:
             pred_cls = name_to_idx[preds[matched_gt[gi]][4]]
             matrix[pred_cls, gt_cls] += 1
+            if pred_cls != gt_cls:
+                mistakes.append(("fp", preds[matched_gt[gi]][4], image_name))
+                mistakes.append(("fn", gt[4], image_name))
         else:
             matrix[nc, gt_cls] += 1
+            mistakes.append(("fn", gt[4], image_name))
 
     for pi, pred in enumerate(preds):
         if pi not in matched_pred:
             matrix[name_to_idx[pred[4]], nc] += 1
+            mistakes.append(("fp", pred[4], image_name))
 
 # Calculations
 def summarize(matrix, class_names):
@@ -280,6 +291,7 @@ def main():
         emit(f"Detected family: {family}  classes: {model_class_names}")
 
         matrix = np.zeros((nc + 1, nc + 1), dtype=np.int64)
+        mistakes = []  # [(kind, class_name, image_name), ...] - kind is "fp" or "fn"
         for image_path in image_paths:
             frame = cv2.imread(str(image_path))
             if frame is None:
@@ -287,7 +299,7 @@ def main():
             h, w = frame.shape[:2]
             gts = load_ground_truth(labels_dir / f"{image_path.stem}.txt", w, h, class_names)
             preds = predictor(frame)
-            match_image(preds, gts, name_to_idx, args.iou, matrix)
+            match_image(preds, gts, name_to_idx, args.iou, matrix, image_path.name, mistakes)
 
         rows = summarize(matrix, class_names)
         emit(f"\n{'Class':<10}{'TP':>6}{'FP':>6}{'FN':>6}{'Precision':>12}{'Recall':>10}{'F1':>8}")
@@ -304,6 +316,26 @@ def main():
         for i, label in enumerate(col_labels):
             row = "".join(f"{matrix[i, j]:>10}" for j in range(nc + 1))
             emit(f"{label[:8]:<8}{row}")
+
+        fp_by_image, fn_by_image = {}, {}
+        for kind, cls_name, image_name in mistakes:
+            bucket = fp_by_image if kind == "fp" else fn_by_image
+            bucket.setdefault(image_name, []).append(cls_name)
+
+        emit(f"\nFalse positives (spurious detections) - {len(fp_by_image)} image(s):")
+        for image_name in sorted(fp_by_image):
+            emit(f"  {image_name}: {fp_by_image[image_name]}")
+
+        emit(f"\nFalse negatives (missed detections) - {len(fn_by_image)} image(s):")
+        for image_name in sorted(fn_by_image):
+            emit(f"  {image_name}: {fn_by_image[image_name]}")
+
+        mistake_images = sorted(set(fp_by_image) | set(fn_by_image))
+        if mistake_images:
+            mistakes_path = Path(args.log_dir) / f"{Path(model_path).stem}_mistakes.txt"
+            mistakes_path.write_text("\n".join(mistake_images) + "\n")
+            emit(f"\n{len(mistake_images)} image(s) with FP/FN written to {mistakes_path} "
+                 f"(one filename per line, for re-annotating/retraining)")
 
     emit(f"\nFull report saved to {log_path}")
 
