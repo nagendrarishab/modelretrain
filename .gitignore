@@ -14,7 +14,7 @@ logs/
 bench_out/
 models/yolo26n_best_ncnn_model
 models/yolo26n_best.onnx
-yolo26*.pt
+yolo26n_best*.pt
 raw/
 raw_labels/
 /data_detect
@@ -23,7 +23,7 @@ data_pose/
 testcase/
 cache/
 venv/
-models/
+src/models/
 data/
 untitled folder
 test_output
