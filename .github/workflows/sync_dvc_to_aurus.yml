@@ -8,6 +8,9 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    env:
+      # aurus branch to sync into — update this one line if it ever changes
+      AURUS_BRANCH: testdvc
     steps:
       - name: Checkout modeltrain
         uses: actions/checkout@v4
@@ -22,10 +25,9 @@ jobs:
           mkdir -p ~/.ssh
           ssh-keyscan github.com >> ~/.ssh/known_hosts
 
-      - name: Clone aurus (whatever its current default branch is)
+      - name: Clone aurus at the target branch
         run: |
-          git clone git@github.com:<YOUR_ORG>/aurus.git /tmp/aurus
-          echo "AURUS_BRANCH=$(git -C /tmp/aurus rev-parse --abbrev-ref HEAD)" >> "$GITHUB_ENV"
+          git clone --branch "$AURUS_BRANCH" --single-branch git@github.com:vasu02004/edge.git /tmp/aurus
 
       - name: Copy model .dvc file(s) into aurus/models
         run: |
