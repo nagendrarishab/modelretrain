@@ -1,7 +1,7 @@
 """
     python src/evaluate_models.py --model-path models/yolo26n_best.pt
-    python src/evaluate_models.py --model-path models/yolo26n_best.pt models/resnet_retinanet_torch_best.pt \
-        models/nanodet_best.pt --conf 0.5 --iou 0.5
+    python src/evaluate_models.py --model-path models/yolo26n_best.pt \
+        models/resnet_retinanet_torch_best.pt --conf 0.5 --iou 0.5
 
 Deliberately NOT self-contained like this repo's trainers/camera scripts: it
 imports load_model()/detect()/get_device() from the run_camera_*_detect.py
@@ -27,8 +27,6 @@ from torchvision.ops import box_iou
 
 from run_camera_mobilenetv4_fasterrcnn_detect import get_device as get_device_mobilenetv4, \
     load_model as load_mobilenetv4, detect as detect_mobilenetv4
-from run_camera_nanodet_torch_detect import get_device as get_device_nanodet_torch, \
-    load_model as load_nanodet_torch, detect as detect_nanodet_torch
 from run_camera_resnet_fasterrcnn_detect import get_device as get_device_resnet_fasterrcnn, \
     load_model as load_resnet_fasterrcnn, detect as detect_resnet_fasterrcnn
 from run_camera_mobilenetv3_fasterrcnn_detect import get_device as get_device_mobilenetv3, \
@@ -137,12 +135,6 @@ def identify_and_load(model_path, conf):
             model, class_names, height, width = load_efficientnet_torch(path_str, device)
             predictor = lambda frame: detect_efficientnet_torch(model, class_names, frame, device, conf, height, width)
             return "efficientnet-retinanet-torch", class_names, predictor
-        if ckpt["family"] == "nanodet-torch":
-            device = get_device_nanodet_torch()
-            model, class_names, img_size, reg_max = load_nanodet_torch(path_str, device)
-            predictor = lambda frame: detect_nanodet_torch(model, class_names, img_size, reg_max, frame, device, conf)
-            return "nanodet-torch", class_names, predictor
-
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt and "backbone" in ckpt:
         family = backbone_family(ckpt["backbone"])
         device = get_device_mobilenetv4()
@@ -157,7 +149,7 @@ def identify_and_load(model_path, conf):
         f"'{path_str}' doesn't match any recognized checkpoint shape - expected a "
         f"filename starting with 'yolo' (Ultralytics), or a MobileNetV4/ResNet/"
         f"MobileNetV3 Faster R-CNN or a ResNet/MobileNet/DenseNet/EfficientNet "
-        f"RetinaNet or NanoDet (PyTorch) dict (a 'model_state_dict' key). Got: {got}."
+        f"RetinaNet (PyTorch) dict (a 'model_state_dict' key). Got: {got}."
     )
 
 
@@ -248,7 +240,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", nargs="+", required=True,
                          help="one or more checkpoints - YOLO, YOLO-pose, ResNet/MobileNet/"
-                              "DenseNet/EfficientNet RetinaNet, NanoDet, or MobileNetV4/ResNet/"
+                              "DenseNet/EfficientNet RetinaNet, or MobileNetV4/ResNet/"
                               "MobileNetV3 Faster R-CNN (all PyTorch); auto-detected per file")
     parser.add_argument("--data", default="testcase/data.yaml")
     parser.add_argument("--split", choices=["train", "val", "test"], default="test")

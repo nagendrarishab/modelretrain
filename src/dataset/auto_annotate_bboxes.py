@@ -43,13 +43,28 @@ raw_labels/<that folder's name>/ are skipped by default (pass --overwrite to
 redo them), and anything drawn on gets moved out into raw/closed, raw/open,
 or raw/extra as usual.
 
+Two ways to place a box, switchable per image with 'm':
+  corners mode (default)  click 4 corners yourself - most precise, good for
+                          an angled or partly occluded box
+  SAM mode                click once on the object and MobileSAM (ultralytics'
+                          SAM("mobile_sam.pt"), auto-downloaded on first use)
+                          segments it and adds its mask's bounding rectangle -
+                          usually a better fit than a hand-drawn box, and
+                          faster when the box is clean and unoccluded. A bad
+                          SAM box can be undone with 'r' and retried, or you
+                          can switch back to corners mode ('m') and draw it
+                          by hand instead.
+
 Controls:
-  left-click x4             place a box's 4 corners, in any order - dots
-                           connect as you click, and the box (the axis-
-                           aligned rectangle enclosing those 4 points) commits
-                           on the 4th click (suggested boxes, if any, are
-                           pre-loaded first - click 4 more corners to add
-                           another)
+  left-click               corners mode: place one of a box's 4 corners (dots
+                           connect as you click; the box - the axis-aligned
+                           rectangle enclosing those 4 points - commits on the
+                           4th click). SAM mode: query MobileSAM at that point
+                           and add its suggested box immediately (low-confidence
+                           or near-whole-image masks are rejected - re-click
+                           more precisely on the object)
+  m                        toggle between corners mode and SAM mode for boxes
+                           you add from here on (shown in the window title bar)
   right-click a box        (raw/extra/ only) toggle that box's class between
                            open/closed
   o / c                    (raw/extra/ only) set the class new boxes will get
@@ -71,6 +86,7 @@ import json
 import os
 import shutil
 import time
+import traceback
 from pathlib import Path
 
 import cv2
@@ -80,7 +96,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from PIL import Image, ImageOps
-from ultralytics import YOLO
+from ultralytics import SAM, YOLO
 
 CLASSES = ["closed", "open"]
 MAX_DISPLAY = 900
@@ -114,7 +130,14 @@ def axis_aligned_to_corners(x1, y1, x2, y2):
     return (x1, y1), (x2, y1), (x2, y2), (x1, y2)
 
 
-def make_mouse_callback(state, disp_w, disp_h, get_class, mixed):
+def make_mouse_callback(state, disp_w, disp_h, get_class, mixed, mode=None,
+                         orig_w=None, orig_h=None, get_sam_model=None, img_path=None,
+                         min_conf=0.5, status=None):
+    """mode - a 1-item list holding "corners" or "sam", toggled with the 'm'
+    key in annotate_one(); None disables SAM mode entirely (auto_annotate_with_model.py's
+    trained-detector suggestions don't need it). SAM mode needs get_sam_model
+    (a lazily-loading callable), img_path, and a status dict to report into."""
+
     def clamp(v, lo, hi):
         return max(lo, min(hi, v))
 
@@ -122,6 +145,29 @@ def make_mouse_callback(state, disp_w, disp_h, get_class, mixed):
         x = clamp(x, 0, disp_w - 1)
         y = clamp(y, 0, disp_h - 1)
         if event == cv2.EVENT_LBUTTONDOWN:
+            if mode is not None and mode[0] == "sam":
+                fx, fy = x * orig_w / disp_w, y * orig_h / disp_h
+                status["message"] = "predicting..."
+                try:
+                    result = predict_box_at_point(get_sam_model(), img_path, fx, fy, min_conf)
+                except Exception as e:
+                    traceback.print_exc()
+                    status["message"] = f"MobileSAM error: {e}"
+                    return
+                if result is None:
+                    status["message"] = "no confident mask at that point - click more precisely on the object"
+                    return
+                x1, y1, x2, y2, conf = result
+                if (x2 - x1) * (y2 - y1) / (orig_w * orig_h) > 0.9:
+                    status["message"] = "mask covers nearly the whole image - probably background, ignored"
+                    return
+                (dx1, dy1, dx2, dy2), = full_rects_to_display([(x1, y1, x2, y2)], orig_w, orig_h, disp_w, disp_h)
+                if dx2 - dx1 >= MIN_BOX_SIZE and dy2 - dy1 >= MIN_BOX_SIZE:
+                    state.boxes.append((axis_aligned_to_corners(dx1, dy1, dx2, dy2), get_class()))
+                    status["message"] = f"box added (conf {conf:.2f})"
+                else:
+                    status["message"] = "mask too small, ignored"
+                return
             state.pending_corners.append((x, y))
             if len(state.pending_corners) == 4:
                 corners = tuple(state.pending_corners)
@@ -246,6 +292,22 @@ def query_generic_detector(detector, image, conf):
     return [tuple(box) for box in results.boxes.xyxy.tolist()]
 
 
+def predict_box_at_point(sam_model, img_path, x, y, min_conf):
+    """Query MobileSAM with a single foreground point (full-res pixel coords)
+    and return (x1, y1, x2, y2, conf) in full-res pixel coords, or None if no
+    mask was returned or its confidence is below min_conf. Used by SAM mode
+    in annotate_one() - a click-to-box alternative to tracing 4 corners."""
+    results = sam_model.predict(str(img_path), points=[[x, y]], labels=[1], verbose=False)
+    boxes = results[0].boxes
+    if boxes is None or len(boxes) == 0:
+        return None
+    conf = float(boxes.conf[0])
+    if conf < min_conf:
+        return None
+    x1, y1, x2, y2 = boxes.xyxy[0].tolist()
+    return x1, y1, x2, y2, conf
+
+
 def load_yolo_label(label_path, disp_w, disp_h):
     """Read a previously saved YOLO-format label file and convert it back to
     (x1, y1, x2, y2, class_id) rects in display pixel coords - lets an
@@ -316,14 +378,28 @@ def suggest_boxes(full_img, orig_w, orig_h, disp_w, disp_h, class_id, args, vlm_
     return initial_rects, source
 
 
-def annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, class_id, window):
+def annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, class_id, window,
+                  orig_w=None, orig_h=None, get_sam_model=None, min_conf=0.5, mode_state=None):
+    """orig_w/orig_h/get_sam_model - pass all three to enable SAM mode (the
+    'm' key); omitted by callers (auto_annotate_with_model.py) that don't need it,
+    in which case 'm' does nothing and only corners mode is available.
+
+    mode_state - a 1-item list ("corners" or "sam") shared across the whole
+    session by the caller, so switching modes on one image carries over to
+    the next instead of resetting every time; a caller that doesn't pass one
+    gets a fresh "corners" start each image instead."""
     mixed = class_id is None
     pending = [0]  # class new boxes get in mixed mode; toggled with o/c
+    sam_available = get_sam_model is not None
+    mode = mode_state if mode_state is not None else (["corners"] if sam_available else None)
+    sam_status = {"message": ""}
 
     state = BoxState()
     state.boxes.extend((axis_aligned_to_corners(x1, y1, x2, y2), cid) for x1, y1, x2, y2, cid in initial_rects)
-    cv2.setMouseCallback(
-        window, make_mouse_callback(state, disp_w, disp_h, lambda: class_id if not mixed else pending[0], mixed))
+    cv2.setMouseCallback(window, make_mouse_callback(
+        state, disp_w, disp_h, lambda: class_id if not mixed else pending[0], mixed,
+        mode=mode, orig_w=orig_w, orig_h=orig_h, get_sam_model=get_sam_model,
+        img_path=path, min_conf=min_conf, status=sam_status))
 
     while True:
         frame = base_img.copy()
@@ -341,11 +417,15 @@ def annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, class_id
                 cv2.line(frame, state.pending_corners[i - 1], (cx, cy), corner_color, 1)
         suggestion_note = f" [{source}: {len(initial_rects)} suggested]" if initial_rects else " [no suggestion]"
         corner_note = f" - {len(state.pending_corners)}/4 corners placed" if state.pending_corners else ""
+        click_hint = "click the object" if sam_available and mode[0] == "sam" else "click 4 corners"
         status = (f" - no boxes, e=confirm empty" if not state.boxes
-                  else f" - {len(state.boxes)} box(es), click 4 corners to add another, r=undo last")
+                  else f" - {len(state.boxes)} box(es), {click_hint} to add another, r=undo last")
         label = "mixed" if mixed else CLASSES[class_id]
         mode_note = f" [pending class: {CLASSES[pending[0]]} (o/c to change, right-click box to toggle)]" if mixed else ""
-        cv2.putText(frame, f"{path.name} [{label}]{suggestion_note}{status}{corner_note}{mode_note}", (10, 24),
+        sam_mode_note = f" [mode: {mode[0]} (m to toggle)]" if sam_available else ""
+        sam_msg_note = f" - {sam_status['message']}" if sam_status["message"] else ""
+        cv2.putText(frame, f"{path.name} [{label}]{suggestion_note}{status}{corner_note}"
+                            f"{mode_note}{sam_mode_note}{sam_msg_note}", (10, 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.imshow(window, frame)
         key = cv2.waitKey(20) & 0xFF
@@ -363,6 +443,10 @@ def annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, class_id
                 state.pending_corners.pop()
             elif state.boxes:
                 state.boxes.pop()
+        elif sam_available and key == ord("m"):
+            mode[0] = "sam" if mode[0] == "corners" else "corners"
+            state.pending_corners = []
+            sam_status["message"] = ""
         elif mixed and key == ord("o"):
             pending[0] = 1
         elif mixed and key == ord("c"):
@@ -403,7 +487,7 @@ def route_and_save(payload, path, raw_dir, labels_dir):
     return dest, dest_img, dest_label
 
 
-def run_sorting_session(args, input_dir, raw_dir, labels_dir, vlm_client, detector, window):
+def run_sorting_session(args, input_dir, raw_dir, labels_dir, vlm_client, detector, window, get_sam_model, mode_state):
     """--input-dir mode: images start in one unsorted folder with no known
     class: annotate every one in mixed mode, then route_and_save() moves it
     into the right raw/<class> folder based on what got drawn.
@@ -466,7 +550,9 @@ def run_sorting_session(args, input_dir, raw_dir, labels_dir, vlm_client, detect
         initial_rects, source = suggest_boxes(
             full_img, orig_w, orig_h, disp_w, disp_h, None, args, vlm_client, detector)
 
-        action, payload = annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, None, window)
+        action, payload = annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, None, window,
+                                        orig_w=orig_w, orig_h=orig_h, get_sam_model=get_sam_model,
+                                        min_conf=args.min_conf, mode_state=mode_state)
 
         if action == "save":
             dest, dest_img, dest_label = route_and_save(payload, path, raw_dir, labels_dir)
@@ -488,7 +574,7 @@ def run_sorting_session(args, input_dir, raw_dir, labels_dir, vlm_client, detect
           f"{len(pending) - saved - skipped} left for next run.")
 
 
-def run_presorted_session(args, raw_dir, labels_dir, vlm_client, detector, window):
+def run_presorted_session(args, raw_dir, labels_dir, vlm_client, detector, window, get_sam_model, mode_state):
     """Original mode: images already live in raw/closed, raw/open, raw/extra
     - each is annotated in place (raw/extra/ in mixed mode) and only its
     label file is written, nothing gets moved."""
@@ -548,7 +634,9 @@ def run_presorted_session(args, raw_dir, labels_dir, vlm_client, detector, windo
             initial_rects, source = suggest_boxes(
                 full_img, orig_w, orig_h, disp_w, disp_h, class_id, args, vlm_client, detector)
 
-        action, payload = annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, class_id, window)
+        action, payload = annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, class_id, window,
+                                        orig_w=orig_w, orig_h=orig_h, get_sam_model=get_sam_model,
+                                        min_conf=args.min_conf, mode_state=mode_state)
 
         if action == "save":
             (labels_dir / cls / (path.stem + ".txt")).write_text(payload)
@@ -586,6 +674,12 @@ def main():
                          help="generic pretrained detector used as fallback when the VLM finds nothing")
     parser.add_argument("--detector-conf", type=float, default=0.25,
                          help="confidence threshold for the fallback detector")
+    parser.add_argument("--sam-model", default="mobile_sam.pt",
+                         help="ultralytics SAM checkpoint for SAM mode ('m' key) - lazily loaded "
+                              "(auto-downloaded on first use if not present) only if you actually "
+                              "switch into SAM mode")
+    parser.add_argument("--min-conf", type=float, default=0.5,
+                         help="minimum MobileSAM mask confidence to accept a SAM-mode click as a box")
     parser.add_argument("--overwrite", action="store_true",
                          help="re-annotate images that already have a label - in --input-dir mode, "
                               "an image counts as already-labeled if labels_dir/<input-dir-name>/ "
@@ -609,14 +703,30 @@ def main():
         vlm_client = genai.Client(api_key=api_key) if args.provider == "gemini" else api_key
     detector = YOLO(args.detector_model)
 
+    # SAM mode ('m' key) loads MobileSAM lazily - only the first time it's
+    # actually switched into - so a session that never uses it pays no cost.
+    sam_holder = {"model": None}
+
+    def get_sam_model():
+        if sam_holder["model"] is None:
+            print(f"    loading MobileSAM ({args.sam_model})...")
+            sam_holder["model"] = SAM(args.sam_model)
+        return sam_holder["model"]
+
+    # Shared across every image in this run: switching into SAM mode with 'm'
+    # on one image carries forward to the next instead of resetting each time.
+    mode_state = ["corners"]
+
     raw_dir = Path(args.raw_dir)
     labels_dir = Path(args.labels_dir)
-    window = "Auto-annotate (click 4 corners=add box, n/y/Enter=save+next, e=confirm empty, r=undo last, s=skip, b=back, q=quit)"
+    window = "Auto-annotate (click 4 corners=add box, m=toggle SAM mode, n/y/Enter=save+next, " \
+             "e=confirm empty, r=undo last, s=skip, b=back, q=quit)"
 
     if args.input_dir:
-        run_sorting_session(args, Path(args.input_dir), raw_dir, labels_dir, vlm_client, detector, window)
+        run_sorting_session(args, Path(args.input_dir), raw_dir, labels_dir, vlm_client, detector, window,
+                             get_sam_model, mode_state)
     else:
-        run_presorted_session(args, raw_dir, labels_dir, vlm_client, detector, window)
+        run_presorted_session(args, raw_dir, labels_dir, vlm_client, detector, window, get_sam_model, mode_state)
 
 
 if __name__ == "__main__":
