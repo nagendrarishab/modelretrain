@@ -1,0 +1,45 @@
+name: Sync model .dvc file to aurus
+
+on:
+  push:
+    paths:
+      - 'models/*.dvc'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout modeltrain
+        uses: actions/checkout@v4
+
+      - name: Set up SSH agent with aurus deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.AURUS_DEPLOY_KEY }}
+
+      - name: Trust github.com host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone aurus (whatever its current default branch is)
+        run: |
+          git clone git@github.com:<YOUR_ORG>/aurus.git /tmp/aurus
+          echo "AURUS_BRANCH=$(git -C /tmp/aurus rev-parse --abbrev-ref HEAD)" >> "$GITHUB_ENV"
+
+      - name: Copy model .dvc file(s) into aurus/models
+        run: |
+          mkdir -p /tmp/aurus/models
+          cp models/*.dvc /tmp/aurus/models/
+
+      - name: Commit and push only if something changed
+        run: |
+          cd /tmp/aurus
+          git add models/*.dvc
+          if git diff --cached --quiet; then
+            echo "No .dvc changes to sync"
+            exit 0
+          fi
+          git -c user.name="modeltrain-bot" -c user.email="actions@users.noreply.github.com" \
+            commit -m "Sync model .dvc file(s) from modeltrain@${GITHUB_SHA::7}"
+          git push origin "HEAD:${AURUS_BRANCH}"

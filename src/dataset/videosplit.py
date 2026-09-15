@@ -1,5 +1,5 @@
 #To split video(s) into a dataset of images, choosing one of three sampling modes
-# python src/videosplit.py --video-path path/to/your_video.mp4 --target-fps 30
+# python src/videosplit.py --video-path path/to/your_video.mp4 --target-fps 1
 # python src/videosplit.py --video-path video1.mp4 video2.mp4 --num-frames 200
 # python src/videosplit.py --video-path video1.mp4 video2.mp4 --frames-per-minute 60
 

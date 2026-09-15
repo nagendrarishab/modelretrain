@@ -7,6 +7,15 @@ Goes straight to the generic detector fallback by default - no key needed,
 and skips the network round-trip + retries entirely. Pass --no-skip-vlm to
 query the VLM for tier-1 box suggestions instead (needs an API key above).
 
+Two zero-shot suggestion tiers (Grounding DINO, then Florence-2) were tried
+here and both removed after real testing against this project's own
+raw/closed and raw/open photos: Grounding DINO missed the box entirely on
+cluttered/distant shots once its wording was corrected to match the actual
+object, and Florence-2 (even after fixing an unrelated label-noise bug)
+confidently pointed at the wrong object in frame (a background vault, a
+wall panel) rather than abstaining - worse than no suggestion at all for a
+review-assisted tool. Back to the simple two-tier fallback below.
+
 Supports multiple boxes per image: both the VLM and the generic detector
 suggest every box they find (not just the top one), and each set of 4
 corner clicks adds a new box rather than replacing the previous one, so if
@@ -27,6 +36,12 @@ whichever matches the class(es) of the box(es) you drew (no boxes -> confirm
 empty with e -> background) - and its label is written alongside it. This
 replaces manually pre-sorting a fresh batch of photos into those folders
 before labeling them.
+
+--input-dir can also point straight at an already-sorted folder like
+raw/background, to review/re-confirm it: images with an existing label under
+raw_labels/<that folder's name>/ are skipped by default (pass --overwrite to
+redo them), and anything drawn on gets moved out into raw/closed, raw/open,
+or raw/extra as usual.
 
 Controls:
   left-click x4             place a box's 4 corners, in any order - dots
@@ -262,6 +277,45 @@ def full_rects_to_display(rects, orig_w, orig_h, disp_w, disp_h):
     return [(clamp_x(x1), clamp_y(y1), clamp_x(x2), clamp_y(y2)) for x1, y1, x2, y2 in rects]
 
 
+def suggest_boxes(full_img, orig_w, orig_h, disp_w, disp_h, class_id, args, vlm_client, detector):
+    """Run the box-suggestion fallback chain against one full-resolution
+    image - VLM (unless --skip-vlm) -> generic YOLO detector -> nothing
+    (manual) - and return (initial_rects, source): initial_rects is already
+    scaled to display pixel coords, ready to pass straight to
+    annotate_one().
+
+    class_id is the image's already-known single class in presorted
+    single-class mode (raw/closed, raw/open), or None in mixed mode
+    (raw/extra/ and --input-dir). Both tiers here are class-agnostic: every
+    box they suggest gets class_id if known, else defaults to 0 ("closed")
+    pending manual o/c correction."""
+    default_class = class_id if class_id is not None else 0
+    source = None
+
+    full_rects = []
+    if not args.skip_vlm:
+        print(f"    querying {args.provider}...")
+        if args.provider == "gemini":
+            full_rects = query_gemini_box(vlm_client, args.model, full_img)
+        else:
+            full_rects = query_openrouter_box(vlm_client, args.openrouter_model, full_img)
+        if full_rects:
+            source = args.provider
+        else:
+            print(f"    {args.provider} found nothing; trying generic detector...")
+
+    if not full_rects:
+        full_rects = query_generic_detector(detector, full_img, args.detector_conf)
+        if full_rects:
+            source = "generic detector"
+        else:
+            print("    generic detector found nothing either; draw manually.")
+
+    initial_rects = [(x1, y1, x2, y2, default_class)
+                      for x1, y1, x2, y2 in full_rects_to_display(full_rects, orig_w, orig_h, disp_w, disp_h)]
+    return initial_rects, source
+
+
 def annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, class_id, window):
     mixed = class_id is None
     pending = [0]  # class new boxes get in mixed mode; toggled with o/c
@@ -352,10 +406,20 @@ def route_and_save(payload, path, raw_dir, labels_dir):
 def run_sorting_session(args, input_dir, raw_dir, labels_dir, vlm_client, detector, window):
     """--input-dir mode: images start in one unsorted folder with no known
     class: annotate every one in mixed mode, then route_and_save() moves it
-    into the right raw/<class> folder based on what got drawn."""
-    pending = sorted(input_dir.glob("*.jpg")) + sorted(input_dir.glob("*.jpeg"))
+    into the right raw/<class> folder based on what got drawn.
+
+    If input_dir is itself one of the raw/<class> folders (e.g. raw/background),
+    a confirmed-empty image gets routed right back where it started instead of
+    moving out - so "done" is tracked via its label file under
+    labels_dir/<input_dir.name> instead, same as presorted mode."""
+    all_found = sorted(input_dir.glob("*.jpg")) + sorted(input_dir.glob("*.jpeg"))
+    if args.overwrite:
+        pending = all_found
+    else:
+        pending = [f for f in all_found if not (labels_dir / input_dir.name / (f.stem + ".txt")).exists()]
     total = len(pending)
-    print(f"{total} images to sort+annotate from {input_dir}.")
+    print(f"{total}/{len(all_found)} images to sort+annotate from {input_dir} "
+          f"(already-labeled ones skipped; use --overwrite to redo).")
 
     if args.start_after:
         names = [f.name for f in pending]
@@ -399,24 +463,8 @@ def run_sorting_session(args, input_dir, raw_dir, labels_dir, vlm_client, detect
         disp_img = full_img.resize((disp_w, disp_h), Image.LANCZOS)
         base_img = cv2.cvtColor(np.array(disp_img), cv2.COLOR_RGB2BGR)
 
-        full_rects, source = [], None
-        if not args.skip_vlm:
-            print(f"    querying {args.provider}...")
-            if args.provider == "gemini":
-                full_rects = query_gemini_box(vlm_client, args.model, full_img)
-            else:
-                full_rects = query_openrouter_box(vlm_client, args.openrouter_model, full_img)
-            source = args.provider
-            if not full_rects:
-                print(f"    {args.provider} found nothing; trying generic detector...")
-        if not full_rects:
-            full_rects = query_generic_detector(detector, full_img, args.detector_conf)
-            source = "generic detector"
-        if not full_rects:
-            print("    generic detector found nothing either; draw manually.")
-            source = None
-        initial_rects = [(x1, y1, x2, y2, 0)
-                          for x1, y1, x2, y2 in full_rects_to_display(full_rects, orig_w, orig_h, disp_w, disp_h)]
+        initial_rects, source = suggest_boxes(
+            full_img, orig_w, orig_h, disp_w, disp_h, None, args, vlm_client, detector)
 
         action, payload = annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, None, window)
 
@@ -497,25 +545,8 @@ def run_presorted_session(args, raw_dir, labels_dir, vlm_client, detector, windo
         if initial_rects:
             source = "existing label"
         else:
-            full_rects, source = [], None
-            if not args.skip_vlm:
-                print(f"    querying {args.provider}...")
-                if args.provider == "gemini":
-                    full_rects = query_gemini_box(vlm_client, args.model, full_img)
-                else:
-                    full_rects = query_openrouter_box(vlm_client, args.openrouter_model, full_img)
-                source = args.provider
-                if not full_rects:
-                    print(f"    {args.provider} found nothing; trying generic detector...")
-            if not full_rects:
-                full_rects = query_generic_detector(detector, full_img, args.detector_conf)
-                source = "generic detector"
-            if not full_rects:
-                print("    generic detector found nothing either; draw manually.")
-                source = None
-            default_class = class_id if class_id is not None else 0
-            initial_rects = [(x1, y1, x2, y2, default_class)
-                              for x1, y1, x2, y2 in full_rects_to_display(full_rects, orig_w, orig_h, disp_w, disp_h)]
+            initial_rects, source = suggest_boxes(
+                full_img, orig_w, orig_h, disp_w, disp_h, class_id, args, vlm_client, detector)
 
         action, payload = annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, class_id, window)
 
@@ -556,7 +587,9 @@ def main():
     parser.add_argument("--detector-conf", type=float, default=0.25,
                          help="confidence threshold for the fallback detector")
     parser.add_argument("--overwrite", action="store_true",
-                         help="re-annotate images that already have a label (presorted mode only)")
+                         help="re-annotate images that already have a label - in --input-dir mode, "
+                              "an image counts as already-labeled if labels_dir/<input-dir-name>/ "
+                              "has a matching .txt file")
     parser.add_argument("--start-after", default=None,
                          help="resume a pass: skip images up to and including this filename "
                               "(e.g. IMG-20260811-WA0002.jpg), which is the last one you finished last run")

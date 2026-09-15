@@ -12,7 +12,7 @@ Rename multiple files in a single time with continuation
 python src/dataset/rename_frames.py --dir raw/closed --labels-dir raw_labels/closed --template "{n:07d}"
 python src/dataset/rename_frames.py --dir raw/open --labels-dir raw_labels/open --continue-dir raw/closed --template "{n:07d}"
 python src/dataset/rename_frames.py --dir raw/extra --labels-dir raw_labels/extra --continue-dir raw/open --template "{n:07d}"
-python src/dataset/rename_frames.py --dir raw/background --continue-dir raw/extra --template "{n:07d}"
+python src/dataset/rename_frames.py --dir raw/background --labels-dir raw_labels/background --continue-dir raw/extra --template "{n:07d}"
 
 """
 import argparse
