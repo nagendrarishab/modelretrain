@@ -2,16 +2,11 @@ torch
 torchvision
 timm
 torchmetrics
-pycocotools
 tqdm
 ultralytics
 opencv-python
 numpy
 pillow
 certifi
-python-dotenv
-google-genai
-httpx
 dvc[s3]
-dotenv
 awscli

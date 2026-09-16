@@ -2,10 +2,6 @@
     python src/run/run_camera_resnet_torch_detect.py --model-path models/resnet_torch_resnet18_detect_best.pt --source webcam
     python src/run/run_camera_resnet_torch_detect.py --model-path models/resnet_torch_resnet18_detect_best.pt --source droidcam \
         --droidcam-ip 192.168.0.107 --droidcam-port 4747
-
-PyTorch counterpart of run_camera_resnet_tf_detect.py, for checkpoints produced by
-train_resnet_torch_detect.py (torchvision ResNet + a 3-level FPN, wrapped in torchvision's
-own RetinaNet - see that file's ResNetFPNBackbone/build_model for the architecture).
 """
 import argparse
 import logging

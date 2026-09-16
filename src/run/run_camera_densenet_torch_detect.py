@@ -2,11 +2,6 @@
     python src/run/run_camera_densenet_torch_detect.py --model-path models/densenet_torch_densenet121_detect_best.pt --source webcam
     python src/run/run_camera_densenet_torch_detect.py --model-path models/densenet_torch_densenet121_detect_best.pt --source droidcam \
         --droidcam-ip 192.168.0.107 --droidcam-port 4747
-
-PyTorch counterpart of run_camera_densenet_tf_detect.py, for checkpoints produced by
-train_densenet_torch_detect.py (torchvision DenseNet + a 3-level FPN, wrapped in
-torchvision's own RetinaNet - see that file's DenseNetFPNBackbone/build_model for the
-architecture).
 """
 import argparse
 import logging

@@ -2,13 +2,6 @@
 python src/dataset/auto_annotate_with_model.py \
     --images-dir testcase/test/images --labels-dir testcase/test/labels \
     --model-path yolo26n_best.pt
-
-Controls: same as auto_annotate_bboxes.py - click a box's 4 corners to add it,
-right-click a box to toggle its class, o/c to set the class new boxes get,
-y/n/Enter to save+advance, e to confirm this image has no box (saves an empty
-label - only when no boxes are drawn), r to undo the last placed corner (or
-last box, if none are pending), s to skip, b to go back, q/Esc to quit
-(progress already saved is kept).
 """
 import argparse
 import sys

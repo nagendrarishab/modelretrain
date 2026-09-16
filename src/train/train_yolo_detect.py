@@ -68,11 +68,9 @@ def analyze_class_distribution(data_dir, names):
 
 
 def filter_low_sample_classes(data_yaml_path, min_samples_per_class):
-    """Drop classes with too few annotations and remap the remaining ones,
-    writing a filtered copy of the dataset alongside the original. Data split
-    (train/val/test) and per-image content are otherwise left untouched.
-    Returns the path to the data.yaml to train on (original if nothing needed excluding).
-    """
+    """Drop classes with too few annotations and remap the remaining ones, writing a
+    filtered copy of the dataset alongside the original (original returned unchanged
+    if no classes need excluding)."""
     data_yaml_path = Path(data_yaml_path)
     data_dir = data_yaml_path.parent
     cfg = yaml.safe_load(data_yaml_path.read_text())

@@ -1,13 +1,4 @@
 """
-    Usage:
-        python src/dataset/rename_frames.py --dir . --start 7000
-        python src/dataset/rename_frames.py --dir . --continue-dir /path/to/existing_dataset
-        python src/dataset/rename_frames.py --dir . --template "{n:05d}"
-
-    Pass --labels-dir to also rename each image's matching YOLO-format label
-    (same stem, a .txt in --labels-dir) so images and labels stay paired:
-    python src/dataset/rename_frames.py --dir data_detect/train/images --labels-dir data_detect/train/labels --start 7000
-
 Rename multiple files in a single time with continuation
 python src/dataset/rename_frames.py --dir raw/closed --labels-dir raw_labels/closed --template "{n:07d}"
 python src/dataset/rename_frames.py --dir raw/open --labels-dir raw_labels/open --continue-dir raw/closed --template "{n:07d}"

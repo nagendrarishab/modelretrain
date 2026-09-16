@@ -1,24 +1,4 @@
 """
-Move the images listed in a logs/<model>_mistakes.txt file (written by
-src/evaluate_models.py, one image filename per line) out of testcase/test
-and into raw/raw_labels, alongside their label file, so they can be
-re-annotated/reviewed and folded back into training data.
-
-Destination folder (background/closed/open/... - whatever testcase/data.yaml
-names) is picked from the image's ground-truth label in testcase/test/labels:
-  - no boxes (empty/missing label)        -> background
-  - every box is the same class           -> that class's name
-  - boxes of more than one class present  -> extra
-
-A name collision at the destination (same filename already in raw/<class>)
-is resolved by content: identical bytes -> treated as an existing duplicate
-and skipped; different bytes -> the incoming file is renamed with a
-"_2"/"_3"/... suffix (image and label kept in sync) instead of being
-silently dropped.
-
-Dry-run by default - prints what would move without touching anything;
-pass --move to actually do it.
-
     # see what would move, touches nothing
     python src/dataset/move_mistakes_to_raw.py --mistakes-file "logs/yolo26n_best 3_mistakes.txt"
 

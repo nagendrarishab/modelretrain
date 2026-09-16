@@ -220,7 +220,6 @@ def match_image(preds, gts, name_to_idx, iou_thres, matrix, image_name, mistakes
             matrix[name_to_idx[pred[4]], nc] += 1
             mistakes.append(("fp", pred[4], image_name))
 
-# Calculations
 def summarize(matrix, class_names):
     nc = len(class_names)
     diag = matrix.diagonal()[:nc]
@@ -229,9 +228,9 @@ def summarize(matrix, class_names):
     fn = matrix[:, :nc].sum(axis=0) - diag
     rows = []
     for i, name in enumerate(class_names):
-        p = tp[i] / (tp[i] + fp[i]) if (tp[i] + fp[i]) > 0 else 0.0 #precision
-        r = tp[i] / (tp[i] + fn[i]) if (tp[i] + fn[i]) > 0 else 0.0 #recall 
-        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0 #F1 score
+        p = tp[i] / (tp[i] + fp[i]) if (tp[i] + fp[i]) > 0 else 0.0
+        r = tp[i] / (tp[i] + fn[i]) if (tp[i] + fn[i]) > 0 else 0.0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
         rows.append((name, int(tp[i]), int(fp[i]), int(fn[i]), p, r, f1))
     return rows
 

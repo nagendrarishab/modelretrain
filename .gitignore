@@ -1,16 +1,11 @@
 .venv/
 __pycache__/
-*.pyc
 runs/
 .DS_Store
 .env
-models_tested/
-data_source_video/
-*.mp4
 *.md
 logs/
 *.zip
-.ipynb_checkpoints/
 bench_out/
 models/yolo26n_best_ncnn_model
 models/yolo26n_best.onnx
@@ -18,13 +13,11 @@ yolo26n_best*.pt
 raw/
 raw_labels/
 /data_detect
-*.ipynb
 data_pose/
 testcase/
-cache/
 venv/
 src/models/
 data/
-untitled folder
-test_output
+cache/
 mobile_sam.pt
+.vscode

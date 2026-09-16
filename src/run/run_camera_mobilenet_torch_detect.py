@@ -3,10 +3,6 @@
     python src/run/run_camera_mobilenet_torch_detect.py --model-path models/mobilenet_torch_v2_detect_best.pt --source droidcam \
         --droidcam-ip 192.168.0.107 --droidcam-port 4747
 
-PyTorch counterpart of run_camera_mobilenet_tf_detect.py, for checkpoints produced by
-train_mobilenet_torch_detect.py (torchvision MobileNetV3-Large + a 3-level FPN, wrapped in
-torchvision's own RetinaNet - see that file's MobileNetFPNBackbone/build_model for the
-architecture).
 """
 import argparse
 import logging

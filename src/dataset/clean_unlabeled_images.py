@@ -1,18 +1,9 @@
 """
-Find images that don't have a matching label file (same filename stem, a
-.txt in --labels-dir) and delete them. Dry-run by default - prints what
-would be deleted without touching anything; pass --delete to actually do it.
-
     # see what would be deleted, touches nothing
     python src/dataset/clean_unlabeled_images.py --images-dir raw/open --labels-dir raw_labels/open
 
     # actually delete them
     python src/dataset/clean_unlabeled_images.py --images-dir raw/open --labels-dir raw_labels/open --delete
-
-Also reports label files with no matching image - usually copy/paste debris
-rather than "forgot to annotate this one", but a different kind of problem,
-so it's a separate --delete-orphan-labels flag rather than being covered by
---delete:
 
     python src/dataset/clean_unlabeled_images.py --images-dir raw/open --labels-dir raw_labels/open --delete-orphan-labels
 """

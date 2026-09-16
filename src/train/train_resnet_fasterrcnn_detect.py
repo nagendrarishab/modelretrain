@@ -56,18 +56,6 @@ def get_device():
 
 
 class YoloFormatDataset(Dataset):
-    """--cache mirrors train_yolo_detect.py's --cache and the train_*_torch_detect.py
-    RetinaNet ports' --cache: avoids re-decoding the same JPEG every epoch. Unlike those
-    RetinaNet ports, Faster R-CNN's own GeneralizedRCNNTransform resizes internally (no
-    fixed height/width here), so what's cached is the image at its native decoded
-    resolution. 'disk' writes it once to a <stem>.npy file under --cache-dir (survives
-    across runs, and across --workers > 0's separate worker processes, since they share
-    the filesystem - writes go through a temp file + atomic rename so concurrent workers
-    racing to cache the same image can't corrupt it). 'ram' keeps a dict in this process
-    only - with --workers > 0 each worker process gets its own private dict, and shuffled
-    sampling means a given worker rarely sees the same image twice, so it's a much weaker
-    cache here than in the (worker-less) RetinaNet ports; 'disk' is the one that matters.
-    'none' decodes fresh every access."""
 
     def __init__(self, split_dir, cache="disk", cache_dir=None):
         self.images_dir = split_dir / "images"

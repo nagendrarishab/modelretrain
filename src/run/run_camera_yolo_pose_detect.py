@@ -5,10 +5,6 @@
     python src/run_camera_yolo_pose_detect.py --model-path models/yolo26n-pose_best.pt --source file \
         --video-path Camera_2026-08-21_17-28-33.mp4 --no-preview
 
-    # export to NCNN for Raspberry Pi deployment (fp16), then exit - same format
-    # already used for the sibling models/yolo26n_best_ncnn_model/
-    python src/run_camera_yolo_pose_detect.py --model-path models/yolo26n-pose_best.pt --export-format ncnn
-
     # FP16 inference for a faster per-frame loop (biggest win on CUDA, smaller on MPS/CPU)
     python src/run_camera_yolo_pose_detect.py --model-path models/yolo26n-pose_best.pt --quantize 16
 

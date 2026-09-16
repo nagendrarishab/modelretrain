@@ -67,15 +67,6 @@ def get_device():
 
 
 class YoloFormatDataset(Dataset):
-    """Same on-disk layout as the TF scripts' load_split() (images/ + YOLO-format labels/),
-    but resizes to a fixed (height, width) up front so it matches the no-op resize
-    build_model() sets up via RetinaNet's min_size/max_size transform.
-
-    --cache mirrors train_yolo_detect.py's --cache: avoids re-decoding+resizing the same
-    JPEG every epoch. 'disk' writes the decoded/resized array to a <stem>_HxW.npy file
-    (same idea as Ultralytics' own disk cache) so it also survives across separate runs;
-    'ram' keeps it in a dict in this process only (nothing written to disk, but lost when
-    the process exits); 'none' matches the old behavior - decode fresh every access."""
 
     def __init__(self, split_dir, height, width, cache="disk", cache_dir=None):
         self.images_dir = split_dir / "images"

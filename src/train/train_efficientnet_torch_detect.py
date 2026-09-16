@@ -58,15 +58,6 @@ def get_device():
 
 
 class YoloFormatDataset(Dataset):
-    """Same on-disk layout as the TF scripts' load_split() (images/ + YOLO-format labels/),
-    but resizes to a fixed (height, width) up front so it matches the no-op resize
-    build_model() sets up via RetinaNet's min_size/max_size transform.
-
-    --cache mirrors train_yolo_detect.py's --cache: avoids re-decoding+resizing the same
-    JPEG every epoch. 'disk' writes the decoded/resized array to a <stem>_HxW.npy file
-    (same idea as Ultralytics' own disk cache) so it also survives across separate runs;
-    'ram' keeps it in a dict in this process only (nothing written to disk, but lost when
-    the process exits); 'none' matches the old behavior - decode fresh every access."""
 
     def __init__(self, split_dir, height, width, cache="disk", cache_dir=None):
         self.images_dir = split_dir / "images"
@@ -147,16 +138,6 @@ def warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor):
 
 
 class EfficientNetFPNBackbone(nn.Module):
-    """EfficientNet-B0 body + a plain 3-level FPN (P3/P4/P5 only, out_channels=256).
-    Mirrors keras_hub's RetinaNetBackbone(min_level=3, max_level=5) used by the TF version
-    of this script. The stride-8/16/32 blocks below (features.3/.5/.8) were found by a
-    dummy forward pass through m.features - EfficientNet's inverted-residual/squeeze-excite
-    blocks don't have descriptive names like ResNet's layer2/3/4 or DenseNet's denseblocks,
-    so unlike those this is just "whichever block's output stride matches, found by
-    inspection" (features.8 is the final 1280-channel projection, same idea as
-    DenseNetFPNBackbone's 'norm5' and MobileNetFPNBackbone's features.16). torchvision's
-    BackboneWithFPN helper always adds an extra P6 level (LastLevelMaxPool), so this wires
-    the body and FPN directly to skip that."""
 
     def __init__(self, efficientnet, height, width, out_channels=256):
         super().__init__()

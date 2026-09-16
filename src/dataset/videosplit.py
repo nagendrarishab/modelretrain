@@ -1,4 +1,3 @@
-#To split video(s) into a dataset of images, choosing one of three sampling modes
 # python src/videosplit.py --video-path path/to/your_video.mp4 --target-fps 1
 # python src/videosplit.py --video-path video1.mp4 video2.mp4 --num-frames 200
 # python src/videosplit.py --video-path video1.mp4 video2.mp4 --frames-per-minute 60
@@ -30,7 +29,6 @@ def extract_frames(video_path, output_dir):
     saved_count = 0
 
     if args.num_frames:
-        # Evenly space the requested number of frames across the full video.
         num_frames = min(args.num_frames, total_frames) if total_frames > 0 else args.num_frames
         frame_indices = {round(i * (total_frames - 1) / max(1, num_frames - 1)) for i in range(num_frames)} if num_frames > 1 else {0}
 

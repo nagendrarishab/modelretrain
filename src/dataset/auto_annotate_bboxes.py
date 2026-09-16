@@ -1,48 +1,4 @@
 """
-Requires an API key in a .env file at the project root for whichever
---provider is selected: GEMINI_API_KEY for gemini, OPENROUTER_API_KEY for
-openrouter.
-
-Goes straight to the generic detector fallback by default - no key needed,
-and skips the network round-trip + retries entirely. Pass --no-skip-vlm to
-query the VLM for tier-1 box suggestions instead (needs an API key above).
-
-Two zero-shot suggestion tiers (Grounding DINO, then Florence-2) were tried
-here and both removed after real testing against this project's own
-raw/closed and raw/open photos: Grounding DINO missed the box entirely on
-cluttered/distant shots once its wording was corrected to match the actual
-object, and Florence-2 (even after fixing an unrelated label-noise bug)
-confidently pointed at the wrong object in frame (a background vault, a
-wall panel) rather than abstaining - worse than no suggestion at all for a
-review-assisted tool. Back to the simple two-tier fallback below.
-
-Supports multiple boxes per image: both the VLM and the generic detector
-suggest every box they find (not just the top one), and each set of 4
-corner clicks adds a new box rather than replacing the previous one, so if
-more than one physical box is in frame, they're pre-loaded together - or
-click 4 corners per box yourself. Clicking the 4 actual corners (rather
-than dragging a single diagonal) gets a tighter box on a box photographed
-at an angle - the saved label is still the axis-aligned rectangle enclosing
-those 4 points, just placed more precisely.
-
-Images in raw/extra/ are treated as "mixed": instead of one class for the
-whole image, each box gets its own open/closed class - for photos where a
-closed box and an open box both appear in frame together.
-
-Pass --input-dir to annotate an unsorted folder instead: every image is
-shown in mixed mode (no pre-known class), and once you save it, the image
-itself is moved into raw/closed, raw/open, raw/extra, or raw/background -
-whichever matches the class(es) of the box(es) you drew (no boxes -> confirm
-empty with e -> background) - and its label is written alongside it. This
-replaces manually pre-sorting a fresh batch of photos into those folders
-before labeling them.
-
---input-dir can also point straight at an already-sorted folder like
-raw/background, to review/re-confirm it: images with an existing label under
-raw_labels/<that folder's name>/ are skipped by default (pass --overwrite to
-redo them), and anything drawn on gets moved out into raw/closed, raw/open,
-or raw/extra as usual.
-
 Two ways to place a box, switchable per image with 'm':
   corners mode (default)  click 4 corners yourself - most precise, good for
                           an angled or partly occluded box
@@ -80,63 +36,42 @@ Controls:
 
 """
 import argparse
-import base64
-import io
-import json
-import os
 import shutil
-import time
 import traceback
 from pathlib import Path
 
 import cv2
-import httpx
 import numpy as np
-from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 from PIL import Image, ImageOps
 from ultralytics import SAM, YOLO
 
 CLASSES = ["closed", "open"]
 MAX_DISPLAY = 900
-CLASS_COLORS = {0: (0, 140, 255), 1: (0, 220, 0)}  # index matches CLASSES order
+CLASS_COLORS = {0: (0, 140, 255), 1: (0, 220, 0)}
 
 
-MIN_BOX_SIZE = 3  # display px - ignore 4 corners clicked too close together to be a real box
+MIN_BOX_SIZE = 3
 
 
 class BoxState:
     def __init__(self):
-        self.pending_corners = []  # up to 4 clicked (x, y) points for the box being placed
-        self.boxes = []  # committed (corners, class_id) - corners = the 4 points as clicked,
-                          # in click order, display pixel coords (whatever quadrilateral that
-                          # traces - not forced to axis-aligned; only the saved label is)
+        self.pending_corners = []
+        self.boxes = []
 
 
 def corners_to_box(corners, class_id):
-    """4 corner points -> the axis-aligned rectangle enclosing them (class-
-    agnostic of click order). Used to derive the saved label and for the
-    min-size check - not for on-screen rendering, which shows the actual
-    quadrilateral instead."""
     xs = [p[0] for p in corners]
     ys = [p[1] for p in corners]
     return min(xs), min(ys), max(xs), max(ys), class_id
 
 
 def axis_aligned_to_corners(x1, y1, x2, y2):
-    """The reverse direction, for seeding VLM/detector-suggested boxes (which
-    come in already axis-aligned) into the same corners-based storage."""
     return (x1, y1), (x2, y1), (x2, y2), (x1, y2)
 
 
 def make_mouse_callback(state, disp_w, disp_h, get_class, mixed, mode=None,
                          orig_w=None, orig_h=None, get_sam_model=None, img_path=None,
                          min_conf=0.5, status=None):
-    """mode - a 1-item list holding "corners" or "sam", toggled with the 'm'
-    key in annotate_one(); None disables SAM mode entirely (auto_annotate_with_model.py's
-    trained-detector suggestions don't need it). SAM mode needs get_sam_model
-    (a lazily-loading callable), img_path, and a status dict to report into."""
 
     def clamp(v, lo, hi):
         return max(lo, min(hi, v))
@@ -173,7 +108,7 @@ def make_mouse_callback(state, disp_w, disp_h, get_class, mixed, mode=None,
                 corners = tuple(state.pending_corners)
                 x1, y1, x2, y2, cid = corners_to_box(corners, get_class())
                 state.pending_corners = []
-                if x2 - x1 >= MIN_BOX_SIZE and y2 - y1 >= MIN_BOX_SIZE:  # ignore accidental clicks
+                if x2 - x1 >= MIN_BOX_SIZE and y2 - y1 >= MIN_BOX_SIZE:
                     state.boxes.append((corners, cid))
         elif event == cv2.EVENT_RBUTTONDOWN and mixed:
             for i in range(len(state.boxes) - 1, -1, -1):  # topmost (last-drawn) box first
@@ -197,106 +132,18 @@ def rect_to_yolo_line(box, disp_w, disp_h):
     return f"{class_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n"
 
 
-PROMPT = """Find every plastic storage box/container (each has a flat lid and may \
-be open or closed) in this image - there may be more than one. Respond with ONLY a
-JSON array, no other text.
-
-Include one object per box found:
-[{"box_2d": [ymin, xmin, ymax, xmax]}, ...]
-where each coordinate is normalized to 0-1000 relative to image height/width.
-
-If no such box is visible anywhere in the image, respond with an empty array: []
-"""
-
-
 def load_full_image(path):
     img = Image.open(path)
     img = ImageOps.exif_transpose(img).convert("RGB")
     return img, img.width, img.height
 
 
-def _parse_box_response(text, image):
-    """Parse a model's raw text reply into a list of (x1, y1, x2, y2) pixel
-    coords - empty if it reported no box. Shared by every VLM provider,
-    since they're all prompted for the identical box_2d JSON format."""
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        text = text[text.find("[") :]
-    boxes = json.loads(text)
-    rects = []
-    for b in boxes:
-        ymin, xmin, ymax, xmax = b["box_2d"]
-        x1 = xmin / 1000 * image.width
-        y1 = ymin / 1000 * image.height
-        x2 = xmax / 1000 * image.width
-        y2 = ymax / 1000 * image.height
-        rects.append((x1, y1, x2, y2))
-    return rects
-
-
-def query_gemini_box(client, model, image, max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=[image, PROMPT],
-                config=types.GenerateContentConfig(temperature=0),
-            )
-            return _parse_box_response(response.text, image)
-        except Exception as e:
-            wait = 2**attempt
-            print(f"    Gemini request failed ({e}); retrying in {wait}s..." if attempt + 1 < max_retries
-                  else f"    Gemini request failed ({e}); giving up, leave box empty.")
-            if attempt + 1 < max_retries:
-                time.sleep(wait)
-    return []
-
-
-def query_openrouter_box(api_key, model, image, max_retries=3):
-    buf = io.BytesIO()
-    image.save(buf, format="JPEG")
-    data_url = f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
-
-    for attempt in range(max_retries):
-        try:
-            response = httpx.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": [
-                        {"type": "text", "text": PROMPT},
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ]}],
-                    "temperature": 0,
-                },
-                timeout=60,
-            )
-            response.raise_for_status()
-            text = response.json()["choices"][0]["message"]["content"]
-            return _parse_box_response(text, image)
-        except Exception as e:
-            wait = 2**attempt
-            print(f"    OpenRouter request failed ({e}); retrying in {wait}s..." if attempt + 1 < max_retries
-                  else f"    OpenRouter request failed ({e}); giving up, leave box empty.")
-            if attempt + 1 < max_retries:
-                time.sleep(wait)
-    return []
-
-
 def query_generic_detector(detector, image, conf):
-    """Return every box the detector finds above conf (any class), in the
-    image's own pixel coordinates."""
     results = detector.predict(image, conf=conf, verbose=False)[0]
     return [tuple(box) for box in results.boxes.xyxy.tolist()]
 
 
 def predict_box_at_point(sam_model, img_path, x, y, min_conf):
-    """Query MobileSAM with a single foreground point (full-res pixel coords)
-    and return (x1, y1, x2, y2, conf) in full-res pixel coords, or None if no
-    mask was returned or its confidence is below min_conf. Used by SAM mode
-    in annotate_one() - a click-to-box alternative to tracing 4 corners."""
     results = sam_model.predict(str(img_path), points=[[x, y]], labels=[1], verbose=False)
     boxes = results[0].boxes
     if boxes is None or len(boxes) == 0:
@@ -309,11 +156,6 @@ def predict_box_at_point(sam_model, img_path, x, y, min_conf):
 
 
 def load_yolo_label(label_path, disp_w, disp_h):
-    """Read a previously saved YOLO-format label file and convert it back to
-    (x1, y1, x2, y2, class_id) rects in display pixel coords - lets an
-    already-labeled image be reopened with its saved boxes pre-loaded instead
-    of re-running the VLM/detector. Returns [] if the file doesn't exist or
-    has no boxes."""
     if not label_path.exists():
         return []
     rects = []
@@ -339,39 +181,13 @@ def full_rects_to_display(rects, orig_w, orig_h, disp_w, disp_h):
     return [(clamp_x(x1), clamp_y(y1), clamp_x(x2), clamp_y(y2)) for x1, y1, x2, y2 in rects]
 
 
-def suggest_boxes(full_img, orig_w, orig_h, disp_w, disp_h, class_id, args, vlm_client, detector):
-    """Run the box-suggestion fallback chain against one full-resolution
-    image - VLM (unless --skip-vlm) -> generic YOLO detector -> nothing
-    (manual) - and return (initial_rects, source): initial_rects is already
-    scaled to display pixel coords, ready to pass straight to
-    annotate_one().
-
-    class_id is the image's already-known single class in presorted
-    single-class mode (raw/closed, raw/open), or None in mixed mode
-    (raw/extra/ and --input-dir). Both tiers here are class-agnostic: every
-    box they suggest gets class_id if known, else defaults to 0 ("closed")
-    pending manual o/c correction."""
+def suggest_boxes(full_img, orig_w, orig_h, disp_w, disp_h, class_id, args, detector):
     default_class = class_id if class_id is not None else 0
-    source = None
 
-    full_rects = []
-    if not args.skip_vlm:
-        print(f"    querying {args.provider}...")
-        if args.provider == "gemini":
-            full_rects = query_gemini_box(vlm_client, args.model, full_img)
-        else:
-            full_rects = query_openrouter_box(vlm_client, args.openrouter_model, full_img)
-        if full_rects:
-            source = args.provider
-        else:
-            print(f"    {args.provider} found nothing; trying generic detector...")
-
+    full_rects = query_generic_detector(detector, full_img, args.detector_conf)
+    source = "generic detector" if full_rects else None
     if not full_rects:
-        full_rects = query_generic_detector(detector, full_img, args.detector_conf)
-        if full_rects:
-            source = "generic detector"
-        else:
-            print("    generic detector found nothing either; draw manually.")
+        print("    generic detector found nothing; draw manually.")
 
     initial_rects = [(x1, y1, x2, y2, default_class)
                       for x1, y1, x2, y2 in full_rects_to_display(full_rects, orig_w, orig_h, disp_w, disp_h)]
@@ -389,7 +205,7 @@ def annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, class_id
     the next instead of resetting every time; a caller that doesn't pass one
     gets a fresh "corners" start each image instead."""
     mixed = class_id is None
-    pending = [0]  # class new boxes get in mixed mode; toggled with o/c
+    pending = [0]
     sam_available = get_sam_model is not None
     mode = mode_state if mode_state is not None else (["corners"] if sam_available else None)
     sam_status = {"message": ""}
@@ -432,7 +248,7 @@ def annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, class_id
 
         if key in (ord("y"), ord("n"), 13):  # y, n, or Enter - all save+advance
             if not state.boxes:
-                continue  # need at least one box before advancing
+                continue
             lines = "".join(rect_to_yolo_line(corners_to_box(corners, cid), disp_w, disp_h)
                             for corners, cid in state.boxes)
             return ("save", lines)
@@ -487,7 +303,7 @@ def route_and_save(payload, path, raw_dir, labels_dir):
     return dest, dest_img, dest_label
 
 
-def run_sorting_session(args, input_dir, raw_dir, labels_dir, vlm_client, detector, window, get_sam_model, mode_state):
+def run_sorting_session(args, input_dir, raw_dir, labels_dir, detector, window, get_sam_model, mode_state):
     """--input-dir mode: images start in one unsorted folder with no known
     class: annotate every one in mixed mode, then route_and_save() moves it
     into the right raw/<class> folder based on what got drawn.
@@ -548,7 +364,7 @@ def run_sorting_session(args, input_dir, raw_dir, labels_dir, vlm_client, detect
         base_img = cv2.cvtColor(np.array(disp_img), cv2.COLOR_RGB2BGR)
 
         initial_rects, source = suggest_boxes(
-            full_img, orig_w, orig_h, disp_w, disp_h, None, args, vlm_client, detector)
+            full_img, orig_w, orig_h, disp_w, disp_h, None, args, detector)
 
         action, payload = annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, None, window,
                                         orig_w=orig_w, orig_h=orig_h, get_sam_model=get_sam_model,
@@ -574,7 +390,7 @@ def run_sorting_session(args, input_dir, raw_dir, labels_dir, vlm_client, detect
           f"{len(pending) - saved - skipped} left for next run.")
 
 
-def run_presorted_session(args, raw_dir, labels_dir, vlm_client, detector, window, get_sam_model, mode_state):
+def run_presorted_session(args, raw_dir, labels_dir, detector, window, get_sam_model, mode_state):
     """Original mode: images already live in raw/closed, raw/open, raw/extra
     - each is annotated in place (raw/extra/ in mixed mode) and only its
     label file is written, nothing gets moved."""
@@ -632,7 +448,7 @@ def run_presorted_session(args, raw_dir, labels_dir, vlm_client, detector, windo
             source = "existing label"
         else:
             initial_rects, source = suggest_boxes(
-                full_img, orig_w, orig_h, disp_w, disp_h, class_id, args, vlm_client, detector)
+                full_img, orig_w, orig_h, disp_w, disp_h, class_id, args, detector)
 
         action, payload = annotate_one(base_img, disp_w, disp_h, initial_rects, source, path, class_id, window,
                                         orig_w=orig_w, orig_h=orig_h, get_sam_model=get_sam_model,
@@ -665,13 +481,8 @@ def main():
                               "presorted raw/closed, raw/open, raw/extra - see the module "
                               "docstring. --overwrite doesn't apply in this mode: an image is "
                               "'done' once it's been moved out of here.")
-    parser.add_argument("--provider", choices=["gemini", "openrouter"], default="openrouter",
-                         help="which VLM to query for tier-1 box suggestions")
-    parser.add_argument("--model", default="gemini-3.6-flash", help="Gemini model name (only used with --provider gemini)")
-    parser.add_argument("--openrouter-model", default="nvidia/nemotron-nano-12b-v2-vl:free",
-                         help="OpenRouter model name (only used with --provider openrouter)")
     parser.add_argument("--detector-model", default="models/yolo26n_best.pt",
-                         help="generic pretrained detector used as fallback when the VLM finds nothing")
+                         help="generic pretrained detector used to suggest boxes")
     parser.add_argument("--detector-conf", type=float, default=0.25,
                          help="confidence threshold for the fallback detector")
     parser.add_argument("--sam-model", default="mobile_sam.pt",
@@ -687,20 +498,8 @@ def main():
     parser.add_argument("--start-after", default=None,
                          help="resume a pass: skip images up to and including this filename "
                               "(e.g. IMG-20260811-WA0002.jpg), which is the last one you finished last run")
-    parser.add_argument("--skip-vlm", action=argparse.BooleanOptionalAction, default=True,
-                         help="go straight to the local detector fallback, e.g. while the VLM's free quota is "
-                              "exhausted (default: on - pass --no-skip-vlm to query the VLM instead)")
     args = parser.parse_args()
 
-    vlm_client = None
-    if not args.skip_vlm:
-        load_dotenv()
-        env_var = "GEMINI_API_KEY" if args.provider == "gemini" else "OPENROUTER_API_KEY"
-        api_key = os.environ.get(env_var)
-        if not api_key:
-            raise SystemExit(f"Set {env_var} in a .env file, or pass --skip-vlm to use only the local detector.")
-        # query_gemini_box needs a genai.Client; query_openrouter_box just needs the raw key.
-        vlm_client = genai.Client(api_key=api_key) if args.provider == "gemini" else api_key
     detector = YOLO(args.detector_model)
 
     # SAM mode ('m' key) loads MobileSAM lazily - only the first time it's
@@ -723,10 +522,10 @@ def main():
              "e=confirm empty, r=undo last, s=skip, b=back, q=quit)"
 
     if args.input_dir:
-        run_sorting_session(args, Path(args.input_dir), raw_dir, labels_dir, vlm_client, detector, window,
+        run_sorting_session(args, Path(args.input_dir), raw_dir, labels_dir, detector, window,
                              get_sam_model, mode_state)
     else:
-        run_presorted_session(args, raw_dir, labels_dir, vlm_client, detector, window, get_sam_model, mode_state)
+        run_presorted_session(args, raw_dir, labels_dir, detector, window, get_sam_model, mode_state)
 
 
 if __name__ == "__main__":
